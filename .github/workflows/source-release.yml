@@ -1,0 +1,46 @@
+name: Source release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  source-release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_NAME" == v* && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo 'Release tag must be vX.Y.Z.' >&2
+            exit 1
+          }
+          printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+      - name: Run tests
+        run: swift test --build-system native
+      - name: Validate native development bundle
+        run: bash ./scripts/build-app.sh
+      - name: Generate formula from exact tagged source archive
+        run: |
+          mkdir -p dist
+          artifact="SpeedSentry-$VERSION-source.tar.gz"
+          curl --fail --location --retry 5 --retry-delay 3 \
+            "https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz" \
+            --output "dist/$artifact"
+          checksum="$(shasum -a 256 "dist/$artifact" | awk '{print $1}')"
+          bash ./scripts/generate-formula.sh --repository "$GITHUB_REPOSITORY" --version "$VERSION" \
+            --sha256 "$checksum" --output dist/speedsentry-formula.rb
+          ruby -c dist/speedsentry-formula.rb
+          cd dist
+          shasum -a 256 "$artifact" > "$artifact.sha256"
+      - name: Publish source release and formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/SpeedSentry-$VERSION-source.tar.gz" \
+            "dist/SpeedSentry-$VERSION-source.tar.gz.sha256" dist/speedsentry-formula.rb \
+            --verify-tag --generate-notes --title "SpeedSentry $VERSION"

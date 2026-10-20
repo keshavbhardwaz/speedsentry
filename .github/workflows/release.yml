@@ -1,0 +1,100 @@
+name: Signed macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag (vX.Y.Z) to build and notarize"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    environment: release
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Validate version and required credentials
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          [[ "$RELEASE_TAG" == v* && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo 'Release tag must be vX.Y.Z.' >&2
+            exit 1
+          }
+          for name in P12_BASE64 P12_PASSWORD SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_SPECIFIC_PASSWORD; do
+            [[ -n "${!name}" ]] || { echo "Missing release secret: $name" >&2; exit 1; }
+          done
+          printf 'VERSION=%s\n' "$version" >> "$GITHUB_ENV"
+          printf 'BUILD_NUMBER=%s\n' "$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          printf 'ARTIFACT=SpeedSentry-%s-universal.zip\n' "$version" >> "$GITHUB_ENV"
+      - name: Run tests
+        run: swift test --build-system native
+      - name: Import Developer ID certificate and notarization credentials
+        env:
+          P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/speedsentry-signing.keychain-db"
+          password="$(openssl rand -base64 32)"
+          echo "::add-mask::$password"
+          printf 'KEYCHAIN_PATH=%s\n' "$keychain" >> "$GITHUB_ENV"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/developer-id.p12" -P "$P12_PASSWORD" \
+            -t cert -f pkcs12 -k "$keychain" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          xcrun notarytool store-credentials speedsentry-release --keychain "$keychain" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD"
+      - name: Build signed universal app
+        env:
+          SIGNING_IDENTITY: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+        run: bash ./scripts/build-app.sh --universal --identity "$SIGNING_IDENTITY"
+      - name: Notarize, staple, and package
+        run: |
+          bash ./scripts/package-release.sh dist/SpeedSentry.app "dist/$ARTIFACT" \
+            --keychain-profile speedsentry-release --keychain "$KEYCHAIN_PATH"
+      - name: Generate checksum and Homebrew cask from final archive
+        run: |
+          cd dist
+          shasum -a 256 "$ARTIFACT" > "$ARTIFACT.sha256"
+          checksum="$(shasum -a 256 "$ARTIFACT" | awk '{print $1}')"
+          bash ../scripts/generate-cask.sh --repository "$GITHUB_REPOSITORY" --version "$VERSION" \
+            --artifact "$ARTIFACT" --sha256 "$checksum" --output speedsentry-cask.rb
+          ruby -c speedsentry-cask.rb
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "dist/$ARTIFACT" "dist/$ARTIFACT.sha256" dist/speedsentry-cask.rb
+          else
+            gh release create "$RELEASE_TAG" "dist/$ARTIFACT" "dist/$ARTIFACT.sha256" \
+              dist/speedsentry-cask.rb --verify-tag --generate-notes --title "SpeedSentry $VERSION"
+          fi
+      - name: Clean signing credentials
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN_PATH:-}" && -f "$KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi
+          rm -f "$RUNNER_TEMP/developer-id.p12"
