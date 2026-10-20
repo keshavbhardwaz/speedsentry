@@ -22,7 +22,7 @@ brew install keshavbhardwaz/tap/speedsentry
 speedsentry
 ```
 
-The formula builds a native architecture `.app` with an ad hoc local signature and installs it in Homebrew's Cellar. Its launcher uses `opt_prefix`, Homebrew's stable symlink to the current version. It requires Swift 5.9+ from Apple's Command Line Tools or Xcode; a full Xcode installation is unnecessary if your CLT is current. Homebrew itself has separate [supported platform requirements](https://docs.brew.sh/Installation).
+The formula builds a native architecture `.app` directly with `xcrun swiftc`, signs it ad hoc locally, and installs it in Homebrew's Cellar. App builds do not require SwiftPM manifest evaluation; `Package.swift` remains for tests and IDE integration. Its launcher uses `opt_prefix`, Homebrew's stable symlink to the current version. It requires Swift 5.9+ from Apple's Command Line Tools or Xcode; a full Xcode installation is unnecessary if your CLT is current. Homebrew itself has separate [supported platform requirements](https://docs.brew.sh/Installation).
 
 To generate the formula manually after the tag is live:
 

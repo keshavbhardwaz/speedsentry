@@ -47,9 +47,8 @@ class Speedsentry < Formula
 
     ENV["VERSION"] = version.to_s
     ENV["CLANG_MODULE_CACHE_PATH"] = (buildpath/".build/clang-module-cache").to_s
-    ENV["SWIFTPM_MODULECACHE_OVERRIDE"] = (buildpath/".build/swift-module-cache").to_s
-    # Homebrew confines the build; SwiftPM's nested sandbox cannot run inside it.
-    system "bash", "./scripts/build-app.sh", "--disable-swift-sandbox"
+    # This dependency-free app compiles directly, bypassing SwiftPM manifest evaluation.
+    system "bash", "./scripts/build-app.sh"
     prefix.install "dist/SpeedSentry.app"
     (bin/"speedsentry").write <<~SH
       #!/bin/sh

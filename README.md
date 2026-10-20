@@ -9,9 +9,10 @@ Requires macOS 13 Ventura or later. Local builds use your Mac's architecture; re
 Install Apple's Xcode Command Line Tools (`xcode-select --install`) or Xcode, then run:
 
 ```sh
-make test
 make run
 ```
+
+`make build` builds without launching. App builds need only Apple's Swift compiler and macOS SDK from current Command Line Tools. Running the XCTest suite separately with `make test` requires full Xcode; some CLT installations do not include XCTest.
 
 The app is built at `dist/SpeedSentry.app`. It appears on the right side of the menu bar, with no Dock icon. macOS decides the exact position; hold **Command** and drag its menu bar item to reposition it.
 
@@ -60,13 +61,14 @@ The project also includes a cask generator and signed universal release workflow
 ## Development
 
 ```sh
-make check                 # Script/plist validation and unit tests
+make check                 # Script/plist validation and unit tests; requires full Xcode
+make test                  # XCTest suite; requires full Xcode
 make build                 # Native-architecture release app, ad hoc signature
 make universal             # Apple silicon + Intel app, ad hoc signature
 bash ./scripts/build-app.sh --configuration debug
 ```
 
-`SpeedSentryCore` contains the measurement, incident, and persistence logic; the executable target owns the menu bar, notifications, scheduling, and login integration. Tests use synthetic samples and local data, not live speed tests. See [manual verification](docs/TESTING.md) before a public release.
+The app build script uses `xcrun swiftc` directly and does not evaluate a SwiftPM manifest. `Package.swift` remains available for tests and IDE integration. `SpeedSentryCore` contains the measurement, incident, and persistence logic; the executable owns the menu bar, notifications, scheduling, and login integration. Tests use synthetic samples and local data, not live speed tests. See [manual verification](docs/TESTING.md) before a public release.
 
 ## Recommendations
 

@@ -1,6 +1,6 @@
 # Verification before release
 
-Automated tests cover deterministic logic and persistence; they do not prove real-world bandwidth accuracy, sleep behavior, notification permission, or Developer ID distribution. Perform these checks on macOS 13 or later before publishing.
+Automated tests cover deterministic logic and persistence; they do not prove real-world bandwidth accuracy, sleep behavior, notification permission, or Developer ID distribution. Running `make test` or `make check` needs full Xcode with XCTest; app builds through `make build` need only current Command Line Tools. Perform these checks on macOS 13 or later before publishing.
 
 1. Run `make check` and `make universal`. Verify `lipo -archs dist/SpeedSentry.app/Contents/MacOS/SpeedSentry` contains `arm64 x86_64`.
 2. Launch one copy of the app. Verify it appears in the menu bar without a Dock icon and that its menu shows a completed sample, sample age, and next check.

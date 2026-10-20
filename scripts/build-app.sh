@@ -8,7 +8,6 @@ IDENTITY="-"
 OUTPUT="$ROOT/dist/SpeedSentry.app"
 VERSION="${VERSION:-0.1.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
-DISABLE_SWIFT_SANDBOX=0
 
 usage() {
   cat <<'USAGE'
@@ -16,6 +15,8 @@ Usage: bash scripts/build-app.sh [--configuration debug|release] [--universal]
                             [--identity 'Developer ID Application: …'] [--output PATH]
                             [--disable-swift-sandbox]
 Environment: VERSION (default 0.1.0), BUILD_NUMBER (default 1).
+The app compiles directly with Apple's Swift compiler; SwiftPM is used only for tests/IDE.
+--disable-swift-sandbox is accepted for compatibility and has no effect.
 The default ad hoc signature is for development on your own Mac.
 USAGE
 }
@@ -32,7 +33,7 @@ while (($#)); do
       shift 2
       ;;
     --universal) UNIVERSAL=1; shift ;;
-    --disable-swift-sandbox) DISABLE_SWIFT_SANDBOX=1; shift ;;
+    --disable-swift-sandbox) shift ;;
     --help|-h) usage; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -51,20 +52,31 @@ STAGING="$(mktemp -d "$ROOT/dist/.bundle.XXXXXX")"
 trap 'rm -rf "$STAGING"' EXIT
 APP="$STAGING/SpeedSentry.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
 
 build_arch() {
   local arch="$1"
   local scratch="$ROOT/.build/$arch-$CONFIGURATION"
-  local swift_args=(--build-system native --package-path "$ROOT" --scratch-path "$scratch" --configuration "$CONFIGURATION" --arch "$arch"
-    --cache-path "$ROOT/.build/swiftpm-cache" --config-path "$ROOT/.build/swiftpm-config" --security-path "$ROOT/.build/swiftpm-security")
-  if ((DISABLE_SWIFT_SANDBOX)); then swift_args+=(--disable-sandbox); fi
-  swift build "${swift_args[@]}" --product SpeedSentry >&2 || return $?
-  swift build "${swift_args[@]}" --show-bin-path
+  local swift_args=(-swift-version 5 -sdk "$SDK_PATH" -target "$arch-apple-macosx13.0"
+    -module-cache-path "$ROOT/.build/compiler-module-cache")
+  if [[ "$CONFIGURATION" == release ]]; then
+    swift_args+=(-O)
+  else
+    swift_args+=(-Onone -g)
+  fi
+  mkdir -p "$scratch" "$ROOT/.build/compiler-module-cache"
+  xcrun swiftc "${swift_args[@]}" -parse-as-library -whole-module-optimization \
+    -emit-object -emit-module -module-name SpeedSentryCore \
+    -emit-module-path "$scratch/SpeedSentryCore.swiftmodule" -o "$scratch/SpeedSentryCore.o" \
+    "$ROOT/Sources/SpeedSentryCore/History.swift" "$ROOT/Sources/SpeedSentryCore/SpeedProbe.swift" >&2 || return $?
+  xcrun swiftc "${swift_args[@]}" -I "$scratch" \
+    "$ROOT/Sources/SpeedSentry/main.swift" "$ROOT/Sources/SpeedSentry/AppDelegate.swift" \
+    "$scratch/SpeedSentryCore.o" -o "$scratch/SpeedSentry" >&2 || return $?
+  printf '%s\n' "$scratch"
 }
 
 export MACOSX_DEPLOYMENT_TARGET=13.0
 export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$ROOT/.build/clang-module-cache}"
-export SWIFTPM_MODULECACHE_OVERRIDE="${SWIFTPM_MODULECACHE_OVERRIDE:-$ROOT/.build/swift-module-cache}"
 if ((UNIVERSAL)); then
   ARM_BIN="$(build_arch arm64)"
   INTEL_BIN="$(build_arch x86_64)"
