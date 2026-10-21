@@ -250,7 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let target = date.addingTimeInterval(interval)
         nextCheck = target
         let scheduled = Timer(fire: max(target, Date().addingTimeInterval(1)), interval: 0, repeats: false) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.requestAutomaticCheck()
             }
