@@ -13,9 +13,9 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The **Source release** workflow runs tests, validates a native app build, downloads the exact GitHub archive for the tag, computes its SHA-256, and publishes a release containing the source archive, checksum, and `speedsentry-formula.rb`. No Apple signing credentials are required. Release tags must use `vX.Y.Z`; do not move a published tag to a different commit.
+Only the read-only CI workflow is active. Source-release and signed-release workflows are stored as **inactive templates** in `docs/workflow-templates/`; GitHub does not run them there. The first release is published explicitly using authenticated GitHub CLI commands below. No Apple signing credentials are required for source distribution. Release tags must use `vX.Y.Z`; do not move a published tag to a different commit.
 
-Copy the published `speedsentry-formula.rb` into the tap as **`Formula/speedsentry.rb`**, then commit and push the tap. It points at the source archive's real tag URL with its actual checksum. The workflow does not push to a different repository automatically.
+The formula must point at the real tagged source archive with its actual checksum. Generate it after the tag is available, publish the release, then copy it into the tap as **`Formula/speedsentry.rb`** and commit and push the tap.
 
 ```sh
 brew install keshavbhardwaz/tap/speedsentry
@@ -39,6 +39,16 @@ bash ./scripts/generate-formula.sh --repository "$repository" --version "$versio
 ruby -c dist/Formula/speedsentry.rb
 ```
 
+Publish the initial source release explicitly after authenticating with `gh auth login`:
+
+```sh
+gh release create "v$version" "dist/SpeedSentry-$version-source.tar.gz" \
+  dist/Formula/speedsentry.rb --repo "$repository" --verify-tag \
+  --title "SpeedSentry $version" --generate-notes
+```
+
+If a release already exists, inspect its assets first; use `gh release upload` to add missing files without replacing published artifacts. The root-level source ZIP used during initial repository setup can be removed from the repository after the proper release asset is available.
+
 Copy that file into the tap, then use `brew audit --formula keshavbhardwaz/tap/speedsentry`, `brew install --build-from-source keshavbhardwaz/tap/speedsentry`, and `brew test keshavbhardwaz/tap/speedsentry` on a clean Mac. Verify notification permission and login integration separately; an ad hoc identity can change between builds. Disable Launch at Login before an upgrade or uninstall, and re-enable it afterward if desired. Never publish a precompiled ad hoc app as a notarized release.
 
 Homebrew's official [tap guide](https://docs.brew.sh/Taps) explains repository naming; the [Formula Cookbook](https://docs.brew.sh/Formula-Cookbook) covers source archives, dependencies, installation and tests.
@@ -56,7 +66,7 @@ Create an Apple **Developer ID Application** certificate with its private key, a
 | `APPLE_TEAM_ID` | Apple developer team identifier |
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
 
-Run **Signed macOS release** manually in GitHub Actions and supply the existing tag, for example `v0.1.0`. You can add required reviewers to the environment. The workflow tests, imports the identity into a temporary keychain, builds Apple silicon and Intel executables, combines them into a universal binary, signs with hardened runtime, submits using `notarytool`, staples Apple's ticket, and validates Gatekeeper assessment. It recreates the ZIP after stapling and checksums that exact ZIP. Credentials are removed in cleanup.
+The optional signed-release template is inactive at `docs/workflow-templates/release.yml`. To opt in later, review its write permissions and secret access, copy it to `.github/workflows/release.yml`, and commit that deliberate change. Then run **Signed macOS release** manually in GitHub Actions and supply the existing tag, for example `v0.1.0`. You can add required reviewers to the environment. The workflow tests, imports the identity into a temporary keychain, builds Apple silicon and Intel executables, combines them into a universal binary, signs with hardened runtime, submits using `notarytool`, staples Apple's ticket, and validates Gatekeeper assessment. It recreates the ZIP after stapling and checksums that exact ZIP. Credentials are removed in cleanup.
 
 It adds `SpeedSentry-0.1.0-universal.zip`, its `.sha256`, and `speedsentry-cask.rb` to the release. Assets are not silently replaced. Copy the cask into the tap as `Casks/speedsentry.rb`, removing the formula of the same name when you migrate distribution, then install with:
 
@@ -91,3 +101,7 @@ bash ./scripts/generate-cask.sh --repository "$repository" --version "$VERSION" 
 For the source formula, run `brew update` then `brew upgrade keshavbhardwaz/tap/speedsentry`. Disable **Launch at Login**, quit the app, and run `brew uninstall keshavbhardwaz/tap/speedsentry` to remove it. History and settings are retained. The formula does not support cask `--zap`; delete local history deliberately after exporting it if needed.
 
 For a future cask, standard removal also keeps history; `brew uninstall --cask --zap keshavbhardwaz/tap/speedsentry` removes local history and preferences. Export CSVs before `--zap` if you want to keep them.
+
+## Optional automation templates
+
+`docs/workflow-templates/source-release.yml` can automate future source releases, and `release.yml` can add signed binaries. Both request `contents: write` and remain inactive. Review and explicitly enable a template by copying it into `.github/workflows/` only when you want that publishing behavior. Keeping them as documentation leaves active CI with `contents: read`.

@@ -8,3 +8,5 @@ dist/
 *.keychain-db
 .env
 .env.*
+work/
+outputs/
