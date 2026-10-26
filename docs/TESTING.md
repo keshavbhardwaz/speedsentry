@@ -13,13 +13,15 @@ Automated tests cover deterministic logic and persistence; they do not prove rea
 9. Check on both Apple silicon and an Intel Mac. A universal binary build alone does not replace testing both hardware families.
 10. For public distribution, extract the exact downloaded release ZIP on a clean Mac and run `codesign --verify --strict --verbose=2`, `xcrun stapler validate`, and `spctl --assess --type execute --verbose=2` against the app. Test the qualified Homebrew cask installation and removal. Do not use quarantine-removal commands to mask distribution issues.
 
+For the 0.1.1 accuracy patch, use the [measurement methodology and verification scope](ACCURACY.md) when reviewing buffered delivery, transport timing, missing-metrics fallback, and invalid responses. Verify that a fast initial sample triggers one 64 MiB confirmation, that only the confirmation's rate is reported, and that Low Data Mode performs only the initial 8 MiB sample. Check the visible data-use disclosure: default mode uses up to 72 MiB per check (about 10.9 GB/day), while Low Data Mode uses 8 MiB (about 1.2 GB/day). Historical samples from earlier versions remain unchanged.
+
 ## Troubleshooting
 
 **No banner:** Check System Settings → Notifications → SpeedSentry, Focus, and notification delivery settings. The incident log still records low samples even if permission is denied.
 
 **No menu bar item:** On a small/notched display, macOS can hide items when space is limited. Quit another menu bar utility temporarily, or Command-drag items to free space.
 
-**Unexpected speed:** Compare under idle network conditions. This small single-stream sample measures the path to Cloudflare and can under-read a fast connection or a long-latency link. VPNs and concurrent traffic change the result.
+**Unexpected speed:** Check the app version and whether Low Data Mode is enabled. Version 0.1.1 replaces callback-gap timing and uses a larger confirmation after fast initial samples in the default mode. Low Data Mode retains the uncertainty of a short 8 MiB sample. Compare under idle network conditions. The conservative whole-request fallback includes connection/server delay. VPNs, concurrent traffic, and short bursts change the result. A longer independent benchmark is useful for sustained performance; a fixed plan-speed cap would not correct the measurement.
 
 **Login item unavailable:** Run the app bundle from a stable installed location, preferably `/Applications`. Check macOS Login Items for an approval request. Launch at login is user-controlled and off by default.
 

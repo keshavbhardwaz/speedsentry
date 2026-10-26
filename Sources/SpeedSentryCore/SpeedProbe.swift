@@ -4,22 +4,24 @@ import Foundation
 /// guarantee of the speed available to every service on the internet.
 public final class SpeedProbe: @unchecked Sendable {
     public static let downloadBytes = 8 * 1_024 * 1_024
-    public static let warmupBytes = 512 * 1_024
+    public static let confirmationDownloadBytes = 64 * 1_024 * 1_024
 
     private let lock = NSLock()
     private var activeOperation: ProbeOperation?
     private let configuration: URLSessionConfiguration
     private let endpoint: URL
     private let expectedBytes: Int
-    private let warmupBytes: Int
     private let nanoseconds: @Sendable () -> UInt64
+    private let delegateQueue: OperationQueue?
+    private let confirmationBytes: Int?
+    private let transportTimingProvider: (@Sendable (URLSessionTaskMetrics) -> TransportTiming?)?
 
-    public convenience init() {
+    public convenience init(lowDataMode: Bool = false) {
         self.init(
             configuration: .ephemeral,
             endpoint: URL(string: "https://speed.cloudflare.com/__down")!,
             expectedBytes: Self.downloadBytes,
-            warmupBytes: Self.warmupBytes
+            confirmationBytes: lowDataMode ? nil : Self.confirmationDownloadBytes
         )
     }
 
@@ -29,10 +31,13 @@ public final class SpeedProbe: @unchecked Sendable {
         configuration: URLSessionConfiguration,
         endpoint: URL,
         expectedBytes: Int,
-        warmupBytes: Int,
-        nanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+        nanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        delegateQueue: OperationQueue? = nil,
+        confirmationBytes: Int? = nil,
+        transportTimingProvider: (@Sendable (URLSessionTaskMetrics) -> TransportTiming?)? = nil
     ) {
-        precondition(expectedBytes > warmupBytes && warmupBytes > 0)
+        precondition(expectedBytes > 0)
+        precondition(confirmationBytes.map { $0 > 0 } ?? true)
         let configuration = configuration.copy() as! URLSessionConfiguration
         configuration.urlCache = nil
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -45,8 +50,10 @@ public final class SpeedProbe: @unchecked Sendable {
         self.configuration = configuration
         self.endpoint = endpoint
         self.expectedBytes = expectedBytes
-        self.warmupBytes = warmupBytes
         self.nanoseconds = nanoseconds
+        self.delegateQueue = delegateQueue
+        self.confirmationBytes = confirmationBytes
+        self.transportTimingProvider = transportTimingProvider
     }
 
     /// Overlapping calls return an unavailable result and never start a second
@@ -70,8 +77,10 @@ public final class SpeedProbe: @unchecked Sendable {
                     configuration: self.configuration,
                     request: self.makeRequest(),
                     expectedBytes: self.expectedBytes,
-                    warmupBytes: self.warmupBytes,
-                    nanoseconds: self.nanoseconds
+                    nanoseconds: self.nanoseconds,
+                    delegateQueue: self.delegateQueue,
+                    confirmationBytes: self.confirmationBytes,
+                    transportTimingProvider: self.transportTimingProvider
                 ) { [weak self] operation, measurement in
                     if let self {
                         self.lock.lock()
@@ -114,7 +123,7 @@ public final class SpeedProbe: @unchecked Sendable {
         request.httpMethod = "GET"
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("no-cache, no-store", forHTTPHeaderField: "Cache-Control")
-        request.setValue("SpeedSentry/0.1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("SpeedSentry/0.1.1", forHTTPHeaderField: "User-Agent")
         return request
     }
 
@@ -150,42 +159,50 @@ private final class ProbeOperation: NSObject, URLSessionDataDelegate, @unchecked
     private let lock = NSLock()
     private let configuration: URLSessionConfiguration
     private let request: URLRequest
-    private let expectedBytes: Int
-    private let warmupBytes: Int
+    private var expectedBytes: Int
     private let nanoseconds: @Sendable () -> UInt64
+    private let delegateQueue: OperationQueue?
+    private let confirmationBytes: Int?
+    private let transportTimingProvider: (@Sendable (URLSessionTaskMetrics) -> TransportTiming?)?
     private var completion: ((ProbeOperation, Measurement) -> Void)?
     private var session: URLSession?
     private var task: URLSessionDataTask?
     private var completed = false
     private var receivedValidResponse = false
     private var bytesReceived = 0
-    private var sampleStartBytes = 0
-    private var sampleStartNanoseconds: UInt64?
-    private var lastDataNanoseconds: UInt64?
+    private var totalBytesReceived = 0
+    private var isConfirmation = false
+    private var requestStartNanoseconds: UInt64?
+    private var transportTiming: TransportTiming?
 
     init(
         configuration: URLSessionConfiguration,
         request: URLRequest,
         expectedBytes: Int,
-        warmupBytes: Int,
         nanoseconds: @escaping @Sendable () -> UInt64,
+        delegateQueue: OperationQueue?,
+        confirmationBytes: Int?,
+        transportTimingProvider: (@Sendable (URLSessionTaskMetrics) -> TransportTiming?)?,
         completion: @escaping (ProbeOperation, Measurement) -> Void
     ) {
         self.configuration = configuration
         self.request = request
         self.expectedBytes = expectedBytes
-        self.warmupBytes = warmupBytes
         self.nanoseconds = nanoseconds
+        self.delegateQueue = delegateQueue
+        self.confirmationBytes = confirmationBytes
+        self.transportTimingProvider = transportTimingProvider
         self.completion = completion
     }
 
     func start() {
         lock.lock()
         guard !completed else { lock.unlock(); return }
-        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
         let task = session.dataTask(with: request)
         self.session = session
         self.task = task
+        requestStartNanoseconds = nanoseconds()
         lock.unlock()
         task.resume()
     }
@@ -198,6 +215,12 @@ private final class ProbeOperation: NSObject, URLSessionDataDelegate, @unchecked
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
+        lock.lock()
+        guard !completed, dataTask.taskIdentifier == task?.taskIdentifier else {
+            lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
         let error: String?
         if let response = response as? HTTPURLResponse {
             if response.statusCode != 200 {
@@ -213,40 +236,56 @@ private final class ProbeOperation: NSObject, URLSessionDataDelegate, @unchecked
         } else {
             error = "Speed server returned an invalid HTTP response."
         }
-        lock.lock()
-        let isComplete = completed
-        if error == nil && !isComplete { receivedValidResponse = true }
+        if error == nil { receivedValidResponse = true }
         lock.unlock()
-        completionHandler(error == nil && !isComplete ? .allow : .cancel)
-        if let error { finish(error: error) }
+        completionHandler(error == nil ? .allow : .cancel)
+        if let error { finish(error: error, taskIdentifier: dataTask.taskIdentifier) }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         lock.lock()
-        guard !completed else { lock.unlock(); return }
+        guard !completed, dataTask.taskIdentifier == task?.taskIdentifier else { lock.unlock(); return }
         // Only byte counters are retained; the download is never accumulated in
         // a Data buffer or written to disk.
         let wouldOverflow = data.count > expectedBytes - bytesReceived
         if wouldOverflow {
             lock.unlock()
-            finish(error: "Speed server sent more data than the allowed sample.")
+            finish(error: "Speed server sent more data than the allowed sample.", taskIdentifier: dataTask.taskIdentifier)
             return
         }
         bytesReceived += data.count
-        let now = nanoseconds()
-        lastDataNanoseconds = now
-        if sampleStartNanoseconds == nil && bytesReceived >= warmupBytes {
-            sampleStartNanoseconds = now
-            sampleStartBytes = bytesReceived
-        }
+        totalBytesReceived += data.count
         lock.unlock()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !completed, task.taskIdentifier == self.task?.taskIdentifier else { return }
+        if let transportTimingProvider {
+            transportTiming = transportTimingProvider(metrics)
+            return
+        }
+        let transactions = metrics.transactionMetrics
+        // Custom URLProtocol implementations may supply no transport metrics.
+        // In that case only the full monotonic request interval is safe to use.
+        guard let transaction = transactions.last else { return }
+        let duration = transaction.responseStartDate.flatMap { start in
+            transaction.responseEndDate.map { $0.timeIntervalSince(start) }
+        } ?? .nan
+        transportTiming = TransportTiming(
+            durationSeconds: duration,
+            bytesReceived: transaction.countOfResponseBodyBytesAfterDecoding,
+            isNetworkLoad: transaction.resourceFetchType == .networkLoad,
+            transactionCount: transactions.count
+        )
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error {
-            finish(error: Self.describe(error))
+            finish(error: Self.describe(error), taskIdentifier: task.taskIdentifier)
         } else {
-            finish(error: nil)
+            finish(error: nil, taskIdentifier: task.taskIdentifier)
         }
     }
 
@@ -258,30 +297,67 @@ private final class ProbeOperation: NSObject, URLSessionDataDelegate, @unchecked
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         completionHandler(nil)
-        finish(error: "Speed server redirected the request; the sample is invalid.")
+        finish(error: "Speed server redirected the request; the sample is invalid.", taskIdentifier: task.taskIdentifier)
     }
 
-    private func finish(error: String?) {
+    private func finish(error: String?, taskIdentifier: Int? = nil) {
         lock.lock()
         guard !completed else { lock.unlock(); return }
-        completed = true
+        if let taskIdentifier, taskIdentifier != task?.taskIdentifier { lock.unlock(); return }
         var description = error
         var speed: Double?
         if description == nil {
             if !receivedValidResponse || bytesReceived != expectedBytes {
                 description = "Speed check ended before the complete sample arrived."
-            } else if let start = sampleStartNanoseconds, let end = lastDataNanoseconds,
-                      end > start, bytesReceived > sampleStartBytes {
-                let seconds = Double(end - start) / 1_000_000_000
-                speed = Double(bytesReceived - sampleStartBytes) * 8 / seconds / 1_000_000
             } else {
-                description = "Speed sample was too short to measure reliably."
+                let end = nanoseconds()
+                let elapsed = requestStartNanoseconds.flatMap { start in
+                    end > start ? Double(end - start) / 1_000_000_000 : nil
+                } ?? .nan
+                do {
+                    // Network response metrics cover ALL payload bytes, including
+                    // those buffered before the delegate receives its first chunk.
+                    let estimate = try ThroughputEstimator.estimate(
+                        bytesReceived: bytesReceived,
+                        requestDurationSeconds: elapsed,
+                        transport: transportTiming
+                    )
+                    if !isConfirmation, let confirmationBytes, estimate.durationSeconds < 1,
+                       let session {
+                        // Short transfers can consume an ISP's burst allowance.
+                        // Confirm fast results with a longer transfer on this session.
+                        // Report that transfer's rate while accounting for all traffic.
+                        var nextRequest = request
+                        var url = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+                        var query = url.queryItems ?? []
+                        query.removeAll { $0.name == "bytes" || $0.name == "cachebust" }
+                        query.append(URLQueryItem(name: "bytes", value: String(confirmationBytes)))
+                        query.append(URLQueryItem(name: "cachebust", value: UUID().uuidString))
+                        url.queryItems = query
+                        nextRequest.url = url.url!
+                        let nextTask = session.dataTask(with: nextRequest)
+                        task = nextTask
+                        expectedBytes = confirmationBytes
+                        bytesReceived = 0
+                        receivedValidResponse = false
+                        transportTiming = nil
+                        isConfirmation = true
+                        requestStartNanoseconds = nanoseconds()
+                        lock.unlock()
+                        nextTask.resume()
+                        return
+                    }
+                    speed = estimate.megabitsPerSecond
+                } catch {
+                    description = error.localizedDescription
+                }
             }
         }
+        completed = true
         let result = Measurement(
             timestamp: Date(),
             megabitsPerSecond: speed,
-            bytesReceived: bytesReceived,
+            bytesReceived: totalBytesReceived,
             errorDescription: description
         )
         let completion = self.completion
