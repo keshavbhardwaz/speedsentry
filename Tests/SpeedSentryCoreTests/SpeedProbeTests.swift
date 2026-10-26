@@ -8,8 +8,8 @@ final class SpeedProbeTests: XCTestCase {
         StubURLProtocol.reset()
     }
 
-    func testStreamingMeasurementExcludesWarmupAndUsesMonotonicTime() async throws {
-        let clock = TestClock([1, 1_000_000_001, 2_000_000_001])
+    func testStreamingMeasurementUsesWholeRequestWhenTransportMetricsAreMissing() async throws {
+        let clock = TestClock([1, 2_000_000_001])
         StubURLProtocol.setHandler { stub in
             stub.respond(length: 10)
             stub.send(Data(repeating: 1, count: 4))
@@ -19,8 +19,9 @@ final class SpeedProbeTests: XCTestCase {
         }
         let result = await makeProbe(clock: clock).measure()
         XCTAssertNil(result.errorDescription)
-        XCTAssertEqual(try XCTUnwrap(result.megabitsPerSecond), 0.000024, accuracy: 0.000000001)
+        XCTAssertEqual(try XCTUnwrap(result.megabitsPerSecond), 0.000040, accuracy: 0.000000001)
         XCTAssertEqual(result.bytesReceived, 10)
+        XCTAssertEqual(clock.callCount, 2, "Data callback cadence must not define the timing window.")
         let request = try XCTUnwrap(StubURLProtocol.requests.first)
         XCTAssertEqual(request.httpMethod, "GET")
         XCTAssertEqual(request.value(forHTTPHeaderField: "Accept-Encoding"), "identity")
@@ -109,15 +110,27 @@ final class SpeedProbeTests: XCTestCase {
         XCTAssertEqual(result.errorDescription, "Speed server sent more data than the allowed sample.")
     }
 
-    func testOneChunkSampleIsUnavailableWhenTimingCannotBeEstablished() async {
+    func testOneChunkSampleUsesWholeRequestTimingInsteadOfCallbackTiming() async throws {
         StubURLProtocol.setHandler { stub in
             stub.respond(length: 10)
             stub.send(Data(repeating: 1, count: 10))
             stub.finish()
         }
         let result = await makeProbe().measure()
+        XCTAssertNil(result.errorDescription)
+        XCTAssertEqual(try XCTUnwrap(result.megabitsPerSecond), 0.000040, accuracy: 0.000000001)
+        XCTAssertEqual(result.bytesReceived, 10)
+    }
+
+    func testBackwardsMonotonicClockCannotProduceAnInflatedSpeed() async {
+        StubURLProtocol.setHandler { stub in
+            stub.respond(length: 10)
+            stub.send(Data(repeating: 1, count: 10))
+            stub.finish()
+        }
+        let result = await makeProbe(clock: TestClock([2, 1])).measure()
         XCTAssertNil(result.megabitsPerSecond)
-        XCTAssertEqual(result.errorDescription, "Speed sample was too short to measure reliably.")
+        XCTAssertEqual(result.errorDescription, ThroughputEstimationError.invalidRequestDuration.localizedDescription)
     }
 
     func testOverlapDoesNotStartSecondRequestAndCancellationAllowsNextCheck() async {
@@ -159,15 +172,15 @@ final class SpeedProbeTests: XCTestCase {
         XCTAssertEqual(result.errorDescription, "Speed check cancelled.")
     }
 
-    private func makeProbe(clock: TestClock = TestClock([1, 1_000_000_001, 2_000_000_001])) -> SpeedProbe {
+    private func makeProbe(clock: TestClock = TestClock([1, 2_000_000_001])) -> SpeedProbe {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [StubURLProtocol.self]
         return SpeedProbe(
             configuration: configuration,
             endpoint: URL(string: "https://speed-probe.invalid/__down")!,
             expectedBytes: 10,
-            warmupBytes: 4,
-            nanoseconds: { clock.next() }
+            nanoseconds: { clock.next() },
+            transportTimingProvider: { _ in nil }
         )
     }
 }
@@ -178,6 +191,12 @@ private final class TestClock: @unchecked Sendable {
     private var index = 0
 
     init(_ values: [UInt64]) { self.values = values }
+
+    var callCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return index
+    }
 
     func next() -> UInt64 {
         lock.lock()

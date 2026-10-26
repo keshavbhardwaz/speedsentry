@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private let defaults = UserDefaults.standard
-    private let probe = SpeedProbe()
+    private var probe = SpeedProbe()
     private var store: HistoryStore?
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
@@ -47,6 +47,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var paused: Bool {
         get { preview || defaults.bool(forKey: "monitoringPaused") }
         set { if !preview { defaults.set(newValue, forKey: "monitoringPaused") } }
+    }
+
+    private var lowDataMode: Bool {
+        get { defaults.bool(forKey: "lowDataMode") }
+        set { if !preview { defaults.set(newValue, forKey: "lowDataMode") } }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -206,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             intervals.addItem(item)
         }
         submenu("Check Every: \(Int(interval / 60)) Minutes", intervals)
+        action("Low Data Mode", #selector(toggleLowDataMode), enabled: !preview, checked: lowDataMode)
         action("Launch at Login", #selector(toggleLogin), enabled: !preview,
                checked: !preview && SMAppService.mainApp.status == .enabled)
         let notificationsTitle: String
@@ -262,6 +268,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     private func checkNow() {
         guard !preview, !isSleeping, !isChecking, store != nil else { return }
+        probe = SpeedProbe(lowDataMode: lowDataMode)
         isChecking = true
         lastAttempt = Date()
         if !paused { scheduleNext(from: lastAttempt!) }
@@ -289,6 +296,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     @objc private func manualCheck() { checkNow() }
+
+    @objc private func toggleLowDataMode() {
+        lowDataMode.toggle()
+        // Apply to the next check; never replace or cancel an in-flight probe.
+        render()
+    }
 
     private func requestAutomaticCheck() {
         guard !preview, !paused, !isSleeping, storageError == nil, store != nil else { return }
@@ -492,8 +505,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc private func about() {
         let alert = NSAlert()
-        alert.messageText = "SpeedSentry \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0")"
-        alert.informativeText = "A lightweight download speed monitor for your menu bar.\n\nDefault: every 10 minutes; alert below 20 Mbps. Each check downloads up to 8 MiB from Cloudflare (about 1.2 GB/day if awake all day).\n\nThis is a sampled, single-connection estimate. Brief drops between checks may be missed. No checks run during sleep. Failed probes mean the check was unavailable; they do not prove an ISP outage.\n\nHistory stays on this Mac for 90 days. All displayed/exported incident times use IST (Asia/Kolkata). Cloudflare receives your IP as the test provider.\n\nHold Command and drag the menu bar item to reposition it. macOS controls its exact placement."
+        alert.messageText = "SpeedSentry \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1")"
+        alert.informativeText = "A lightweight download speed monitor for your menu bar.\n\nDefault: every 10 minutes; alert below 20 Mbps. A check starts with 8 MiB from Cloudflare. Fast results get a separate 64 MiB confirmation to reduce short-burst inflation. At most 72 MiB/check (about 10.9 GB/day if awake all day). Slower checks use only 8 MiB.\n\nLow Data Mode uses one 8 MiB sample (about 1.2 GB/day), with less protection against short speed bursts. Changes apply to the next check.\n\nThis is an estimate of the tested path, not an ISP plan guarantee. Brief drops between checks may be missed. No checks run during sleep. Failed probes do not prove an ISP outage.\n\nHistory stays on this Mac for 90 days. All displayed/exported incident times use IST (Asia/Kolkata). Cloudflare receives your IP as the test provider.\n\nHold Command and drag the menu bar item to reposition it. macOS controls its exact placement."
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }

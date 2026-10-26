@@ -27,17 +27,21 @@ The local build has an ad hoc signature for use on your own Mac. It is not the s
 - Notifies when a measured download estimate is below 20 Mbps. Each low result is recorded; repeated low results in the same incident do not repeatedly notify. Recovery closes the incident.
 - Records network failures separately from measured low speeds.
 - Keeps samples and closed incidents locally for up to 90 days, with fixed record-count limits. Ongoing incidents remain until recovery is observed. Export history to CSV with explicit `Asia/Kolkata` timestamps (`+05:30`, IST), regardless of the Mac's selected time zone.
-- Provides pause, threshold/interval controls, and an optional login item. There is no background daemon after you quit the app.
+- Provides pause, threshold/interval controls, Low Data Mode, and an optional login item. There is no background daemon after you quit the app.
 
 macOS must allow notifications for SpeedSentry. Focus modes and macOS notification preferences can suppress banners even when an incident is recorded. Open **System Settings → Notifications → SpeedSentry** if alerts are missing.
 
 ## Measurement and data use
 
-SpeedSentry makes one HTTPS request to Cloudflare's speed-test download endpoint per check. It streams a sample capped at 8 MiB and omits the first 512 KiB from the timed estimate. It does not keep the downloaded payload. Each result estimates throughput to that endpoint, influenced by Wi-Fi, routing, VPNs, server conditions, and test duration. It is not a certified ISP benchmark or an upload/latency test.
+**Default monitoring can use up to 72 MiB per check, about 10.9 GB/day at 10-minute intervals while continuously awake.** Enable **Low Data Mode** to use 8 MiB per check, about 1.2 GB/day, accepting that short bursts may overstate longer-term performance. Protocol overhead and manual checks add traffic.
 
-A sample must finish within 30 seconds. Extremely slow connections (roughly below 2.24 Mbps, and potentially higher with connection overhead) can time out before the full sample finishes. These are recorded and alerted as **unavailable**, rather than assigned an inaccurate numeric speed.
+In the default adaptive mode, a check starts with an 8 MiB HTTPS download from Cloudflare. If its validated elapsed time is under one second, the app downloads a 64 MiB confirmation using the same URLSession and reports that confirmation's throughput. Otherwise it reports the initial 8 MiB result. The initial and confirmation rates are not averaged. Low Data Mode skips the larger confirmation. The same session permits connection reuse, although the network stack controls whether a connection is reused.
 
-At 10-minute intervals, 144 full 8 MiB samples use about **1.2 GB per 24 hours** while continuously awake, plus small protocol overhead. Manual checks add traffic. A full-buffer transfer can already be in flight when cancellation takes effect. Pause monitoring on a metered connection or increase the interval.
+Version 0.1.1 counts each complete payload without discarding warmup bytes. It prefers URLSession's transport response-start to response-end interval rather than timing data-delegate callbacks. Data can be buffered before callbacks arrive close together, which could inflate estimates in 0.1.0. A short transfer can also capture a real initial burst, so larger confirmation addresses a separate limitation. When transport metrics are absent, monotonic whole-request elapsed time includes setup/server delay for a conservative estimate. Invalid or incomplete checks are recorded as **unavailable**. See [measurement accuracy](docs/ACCURACY.md) for details.
+
+Each request has a 30-second timeout; a check with confirmation may take up to about 60 seconds including setup delays. Cancellation aborts the whole check. History records total received traffic across both samples, while the reported confirmation speed uses only its 64 MiB payload and duration.
+
+Each result estimates download throughput to one endpoint. It is not an upload/latency test or a guarantee of sustained ISP capacity. Wi-Fi, routing, VPNs, server conditions, competing traffic, and transfer duration affect the result. Values are not capped at an assumed plan speed, and existing historical measurements remain unchanged. Pause monitoring on a metered connection or increase the interval; cancellation cannot recall data already in flight.
 
 Checks consume real bandwidth briefly and can affect other downloads. The app does not prevent sleep. It performs no checks while asleep and performs a fresh check after wake when the last result is stale. A drop that happens and recovers between checks may never be observed. History times mark detection, not the exact beginning of a connection problem.
 
@@ -47,7 +51,7 @@ History stays in `~/Library/Application Support/SpeedSentry/`; settings use macO
 
 ## Homebrew distribution
 
-The Homebrew formula builds version **0.1.0** from source on the installing Mac. Source lives in [`keshavbhardwaz/speedsentry`](https://github.com/keshavbhardwaz/speedsentry), with the formula in [`keshavbhardwaz/homebrew-tap`](https://github.com/keshavbhardwaz/homebrew-tap). Install and launch with:
+The Homebrew formula builds version **0.1.1** from source on the installing Mac. Source lives in [`keshavbhardwaz/speedsentry`](https://github.com/keshavbhardwaz/speedsentry), with the formula in [`keshavbhardwaz/homebrew-tap`](https://github.com/keshavbhardwaz/homebrew-tap). Install and launch with:
 
 ```sh
 brew install keshavbhardwaz/tap/speedsentry
@@ -56,7 +60,7 @@ speedsentry
 
 The formula requires Swift 5.9 or later from current Apple Command Line Tools or Xcode. The app itself supports macOS 13+, while Homebrew's [current platform support](https://docs.brew.sh/Installation) has its own requirements.
 
-The project also includes a cask generator and signed universal release workflow for future precompiled distribution. See [publishing and Homebrew setup](docs/RELEASING.md).
+The project also includes a cask generator and inactive signed universal release template for future precompiled distribution. See [publishing and Homebrew setup](docs/RELEASING.md).
 
 ## Development
 

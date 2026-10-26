@@ -17,20 +17,20 @@ jobs:
         run: |
           for script in scripts/*.sh; do bash -n "$script" || exit; done
           plutil -lint Resources/Info.plist
-      - name: Run deterministic unit tests
+      - name: Run unit and loopback accuracy tests
         run: swift test --build-system native
       - name: Build development app
         run: bash ./scripts/build-app.sh --configuration debug
       - name: Check generated Homebrew cask
         run: |
-          artifact="SpeedSentry-0.1.0-universal.zip"
+          artifact="SpeedSentry-0.1.1-universal.zip"
           ditto -c -k --sequesterRsrc --keepParent dist/SpeedSentry.app "$RUNNER_TEMP/$artifact"
           checksum="$(shasum -a 256 "$RUNNER_TEMP/$artifact" | awk '{print $1}')"
-          bash ./scripts/generate-cask.sh --repository "$GITHUB_REPOSITORY" --version 0.1.0 \
+          bash ./scripts/generate-cask.sh --repository "$GITHUB_REPOSITORY" --version 0.1.1 \
             --artifact "$artifact" --sha256 "$checksum" --output "$RUNNER_TEMP/speedsentry.rb"
           ruby -c "$RUNNER_TEMP/speedsentry.rb"
           tar -czf "$RUNNER_TEMP/source.tar.gz" Package.swift Sources Resources scripts
           source_checksum="$(shasum -a 256 "$RUNNER_TEMP/source.tar.gz" | awk '{print $1}')"
-          bash ./scripts/generate-formula.sh --repository "$GITHUB_REPOSITORY" --version 0.1.0 \
+          bash ./scripts/generate-formula.sh --repository "$GITHUB_REPOSITORY" --version 0.1.1 \
             --sha256 "$source_checksum" --output "$RUNNER_TEMP/speedsentry-formula.rb"
           ruby -c "$RUNNER_TEMP/speedsentry-formula.rb"
