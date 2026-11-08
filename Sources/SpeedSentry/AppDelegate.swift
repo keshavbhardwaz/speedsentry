@@ -1,4 +1,7 @@
 import AppKit
+import SwiftUI
+import Network
+import CoreWLAN
 import ServiceManagement
 import SpeedSentryCore
 @preconcurrency import UserNotifications
@@ -8,6 +11,35 @@ import UniformTypeIdentifiers
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     private let defaults = UserDefaults.standard
     private var probe = SpeedProbe()
+    private var insights: InsightsStore?
+    private var connectionTimer: Timer?
+    private var connectionTask: Task<Void, Never>?
+    private var uploadTask: Task<Void, Never>?
+    private let pathMonitor = NWPathMonitor()
+    private var networkName = "Detecting network"
+    private var currentSSID: String?
+    private var networkIdentity: String?
+    private var expensiveNetwork = false
+    private var connectionFailures = 0
+    private var latestConnection: ConnectionSample?
+    private var dashboardWindow: NSWindow?
+    private let dashboardModel = DashboardModel()
+    private var smartSchedule: Bool {
+        get { defaults.bool(forKey: "smartSchedule") }
+        set { defaults.set(newValue, forKey: "smartSchedule") }
+    }
+    private var profiles: [NetworkProfile] {
+        get { (defaults.data(forKey: "networkProfiles").flatMap { try? JSONDecoder().decode([NetworkProfile].self, from: $0) } ?? []).filter(\.isValid) }
+        set { if let data = try? JSONEncoder().encode(newValue) { defaults.set(data, forKey: "networkProfiles") } }
+    }
+    private var activeProfile: NetworkProfile? {
+        MonitoringPolicy.profile(profiles: profiles, ssid: currentSSID,
+            manualID: defaults.string(forKey: "manualProfileID").flatMap(UUID.init(uuidString:)))
+    }
+    private var effectiveThreshold: Double { activeProfile?.thresholdMbps ?? threshold }
+    private var speedTestsBlocked: Bool { activeProfile?.pauseSpeedTests == true || expensiveNetwork }
+    private var effectiveInterval: TimeInterval { MonitoringPolicy.speedInterval(smart: smartSchedule, configured: interval) }
+    private var stale: Bool { MonitoringPolicy.isStale(latest?.timestamp, now: Date(), interval: effectiveInterval) }
     private var store: HistoryStore?
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
@@ -26,7 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var notificationStatus: UNAuthorizationStatus = .notDetermined
     private var notificationError: String?
     // Preview exercises the real menu without network, settings, logs, or permission prompts.
-    private let preview = CommandLine.arguments.contains("--preview")
+    private let preview = CommandLine.arguments.contains("--preview") || Bundle.main.bundleIdentifier?.hasSuffix(".preview") == true
 
     private var threshold: Double {
         get {
@@ -56,7 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prevent duplicate probes and concurrent writes when a second copy is opened.
-        if let identifier = Bundle.main.bundleIdentifier,
+        if !preview, let identifier = Bundle.main.bundleIdentifier,
            NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
             .contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }) {
             NSApp.terminate(nil)
@@ -71,6 +103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             do {
                 store = try HistoryStore(directoryURL: HistoryStore.defaultDirectoryURL)
                 latest = store?.history.measurements.last
+                insights = try InsightsStore(directoryURL: HistoryStore.defaultDirectoryURL)
+                lastAttempt = latest?.timestamp
             } catch {
                 storageError = error.localizedDescription
             }
@@ -85,13 +119,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         workspace.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
         render()
         rebuildMenu()
-        if preview { return }
+        if preview { showDashboard(); return }
         if let error = storageError {
             showError("Monitoring could not start", "SpeedSentry could not open its history. Your existing files have been preserved.\n\n\(error)\n\nUse Open Log Folder to inspect or back up the files, then restart the app.")
             return
         }
         requestNotifications(openSettingsIfDenied: false)
-        if !paused { checkNow() }
+        startNetworkMonitoring()
+        // First path update starts monitoring after metered-network policy is known.
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -101,6 +136,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         wakeTask?.cancel()
         checkTask?.cancel()
         probe.cancel()
+        connectionTask?.cancel(); uploadTask?.cancel(); connectionTimer?.invalidate(); pathMonitor.cancel()
+        try? insights?.interrupt()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
@@ -122,15 +159,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             symbol = "arrow.triangle.2.circlepath"
             title = "…"
             color = .labelColor
+        } else if uploadTask != nil {
+            symbol = "arrow.up.circle"; title = "↑…"; color = .labelColor
+        } else if connectionFailures >= 2 {
+            symbol = "wifi.exclamationmark"; title = "Offline?"; color = .systemRed
         } else if storageError != nil {
             symbol = "exclamationmark.triangle"
             title = "Log!"
             color = .systemOrange
         } else if let result = latest {
             if let speed = result.megabitsPerSecond {
-                symbol = speed < threshold ? "exclamationmark.triangle.fill" : "arrow.down.circle"
-                title = Self.speed(speed, threshold: threshold)
-                color = speed < threshold ? .systemOrange : .labelColor
+                symbol = speed < effectiveThreshold ? "exclamationmark.triangle.fill" : "arrow.down.circle"
+                title = Self.speed(speed, threshold: effectiveThreshold) + (stale ? " ·" : "")
+                color = speed < effectiveThreshold ? .systemOrange : .labelColor
             } else {
                 symbol = "wifi.exclamationmark"
                 title = "Error"
@@ -146,27 +187,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         button.contentTintColor = color
         button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         button.title = " \(title)"
-        button.setAccessibilityLabel("SpeedSentry: \(title) megabits per second")
+        button.setAccessibilityLabel("SpeedSentry: \(title)\(stale ? ", stale result" : "")")
         let last = latest.map { ISTDate.string($0.timestamp) } ?? "No checks yet"
-        button.toolTip = "SpeedSentry · Download Mbps\nLast check: \(last)\nAlert below \(Self.thresholdText(threshold)) Mbps · Every \(Int(interval / 60)) minutes"
+        button.toolTip = "SpeedSentry · Download Mbps\nLast check: \(last)\nAlert below \(Self.thresholdText(effectiveThreshold)) Mbps · Every \(Int(effectiveInterval / 60)) minutes\n\(stale ? "Result is stale" : "Result is recent") · \(networkName)"
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
         label("SpeedSentry", bold: true)
+        label("Network: \(networkName) · Profile: \(activeProfile?.name ?? "Default")")
+        if speedTestsBlocked { label("Full tests paused on this profile or metered network") }
+        if stale, latest != nil { label("Download result is stale · run Check Now to refresh") }
+        if let connection = latestConnection {
+            label(connection.reachable ? "HTTPS response: \(Int(connection.latencyMilliseconds ?? 0)) ms" : "Connection check: both endpoints unreachable")
+            label("Connection checked: \(ISTDate.string(connection.timestamp))")
+        }
+        if let upload = insights?.snapshot.uploads.last {
+            label("Last upload: \(upload.megabitsPerSecond.map { String(format: "%.1f Mbps", $0) } ?? "Unavailable") · \(ISTDate.string(upload.timestamp))")
+        }
         if let result = latest {
-            label(result.megabitsPerSecond.map { "Download: \(Self.speed($0, threshold: threshold)) Mbps" } ?? "Download check unavailable")
+            label(result.megabitsPerSecond.map { "Download: \(Self.speed($0, threshold: effectiveThreshold)) Mbps" } ?? "Download check unavailable")
             label("Checked: \(ISTDate.string(result.timestamp))")
             if let failure = result.errorDescription { label(String(failure.prefix(110))) }
         } else {
             label("Download: waiting for first check")
         }
+        if activeProfile != nil { label("Alert threshold from active profile: \(Self.thresholdText(effectiveThreshold)) Mbps") }
         if let error = storageError { label("Logging error: \(String(error.prefix(90)))") }
         if isChecking { label("Checking now…") }
         else if paused { label(preview ? "Preview · monitoring paused" : "Monitoring paused") }
         else if let date = nextCheck { label("Next: \(ISTDate.string(date))") }
         menu.addItem(.separator())
-        action("Check Now", #selector(manualCheck), key: "r", enabled: !isChecking && !preview && store != nil)
+        action("Check Now", #selector(manualCheck), key: "r", enabled: !isChecking && uploadTask == nil && !speedTestsBlocked && !preview && store != nil && insights != nil)
+        action("Test Upload Now (4 MiB)", #selector(testUpload), enabled: !preview && !isChecking && uploadTask == nil && !speedTestsBlocked && store != nil)
+        action("History & Daily Reports…", #selector(showDashboard))
         action(paused ? "Resume Monitoring" : "Pause Monitoring", #selector(togglePause), enabled: !preview && store != nil)
         menu.addItem(.separator())
         let incidents = NSMenu()
@@ -200,7 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         custom.target = self
         custom.isEnabled = !preview
         thresholds.addItem(custom)
-        submenu("Alert Below: \(Self.thresholdText(threshold)) Mbps", thresholds)
+        submenu("Default Alert Below: \(Self.thresholdText(threshold)) Mbps", thresholds)
         let intervals = NSMenu()
         for minutes in [5, 10, 15, 30, 60] {
             let item = NSMenuItem(title: "\(minutes) minutes", action: #selector(setInterval(_:)), keyEquivalent: "")
@@ -210,7 +264,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             item.isEnabled = !preview
             intervals.addItem(item)
         }
-        submenu("Check Every: \(Int(interval / 60)) Minutes", intervals)
+        submenu("Fixed Schedule: \(Int(interval / 60)) Minutes", intervals)
+        action("Smart Schedule (hourly speed, minute connection)", #selector(toggleSmartSchedule), enabled: !preview, checked: smartSchedule)
+        let profileMenu = NSMenu()
+        let defaultProfile = NSMenuItem(title: "Default (global threshold)", action: #selector(selectProfile(_:)), keyEquivalent: "")
+        defaultProfile.target = self; defaultProfile.representedObject = ""; defaultProfile.state = activeProfile == nil ? .on : .off
+        profileMenu.addItem(defaultProfile)
+        for profile in profiles {
+            let item = NSMenuItem(title: "\(profile.name) · \(Self.thresholdText(profile.thresholdMbps)) Mbps\(profile.pauseSpeedTests ? " · tests paused" : "")", action: #selector(selectProfile(_:)), keyEquivalent: "")
+            item.target = self; item.representedObject = profile.id.uuidString; item.state = activeProfile?.id == profile.id ? .on : .off
+            profileMenu.addItem(item)
+        }
+        submenu("Network Profiles", profileMenu)
+        action("Add / Edit Current Network Profile…", #selector(editProfile), enabled: !preview)
+        action("Delete Active Profile", #selector(deleteProfile), enabled: !preview && activeProfile != nil)
         action("Low Data Mode", #selector(toggleLowDataMode), enabled: !preview, checked: lowDataMode)
         action("Launch at Login", #selector(toggleLogin), enabled: !preview,
                checked: !preview && SMAppService.mainApp.status == .enabled)
@@ -252,8 +319,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private func scheduleNext(from date: Date = Date()) {
         timer?.invalidate()
         nextCheck = nil
-        guard !paused, !isSleeping, storageError == nil, store != nil else { return }
-        let target = date.addingTimeInterval(interval)
+        guard !paused, !isSleeping, storageError == nil, store != nil, !speedTestsBlocked else { return }
+        let target = date.addingTimeInterval(effectiveInterval)
         nextCheck = target
         let scheduled = Timer(fire: max(target, Date().addingTimeInterval(1)), interval: 0, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -267,7 +334,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func checkNow() {
-        guard !preview, !isSleeping, !isChecking, store != nil else { return }
+        guard !preview, !isSleeping, !isChecking, uploadTask == nil, !speedTestsBlocked, store != nil, insights != nil else { return }
+        connectionTask?.cancel(); connectionTask = nil
         probe = SpeedProbe(lowDataMode: lowDataMode)
         isChecking = true
         lastAttempt = Date()
@@ -281,7 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             guard !Task.isCancelled, currentGeneration == self.generation else { return }
             self.latest = result
             do {
-                let event = try self.store?.record(result, thresholdMbps: self.threshold)
+                let event = try self.store?.record(result, thresholdMbps: self.effectiveThreshold)
                 self.storageError = nil
                 if self.nextCheck == nil { self.scheduleNext(from: self.lastAttempt ?? Date()) }
                 if let event { self.notify(event) }
@@ -291,6 +359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                 self.storageError = error.localizedDescription
                 self.showError("History could not be saved", "Automatic monitoring has stopped so incidents are not lost silently. Check available disk space and the log folder, then use Check Now to retry or restart SpeedSentry.\n\n\(error.localizedDescription)")
             }
+            self.refreshDashboard()
             self.render()
         }
     }
@@ -304,7 +373,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func requestAutomaticCheck() {
-        guard !preview, !paused, !isSleeping, storageError == nil, store != nil else { return }
+        guard !preview, !paused, !isSleeping, storageError == nil, store != nil, !speedTestsBlocked else { return }
+        if uploadTask != nil { pendingAutomaticCheck = true; return }
         if isChecking { pendingAutomaticCheck = true }
         else { checkNow() }
     }
@@ -324,6 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         paused.toggle()
         wakeTask?.cancel()
         if paused {
+            stopConnectionMonitoring()
             generation += 1
             pendingAutomaticCheck = false
             timer?.invalidate()
@@ -331,6 +402,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             checkTask?.cancel()
             probe.cancel()
         } else {
+            startConnectionMonitoring()
             // If cancellation is still unwinding, finishCheck starts the pending check.
             requestAutomaticCheck()
         }
@@ -339,6 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc private func willSleep() {
         isSleeping = true
+        stopConnectionMonitoring()
         generation += 1
         pendingAutomaticCheck = false
         wakeTask?.cancel()
@@ -353,6 +426,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         isSleeping = false
         wakeTask?.cancel()
         guard !paused, storageError == nil else { render(); return }
+        startConnectionMonitoring()
         let wakeGeneration = generation
         wakeTask = Task { [weak self] in
             do { try await Task.sleep(nanoseconds: 3_000_000_000) }
@@ -360,7 +434,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             guard let self, !self.paused, !self.isSleeping, self.generation == wakeGeneration, self.storageError == nil else { return }
             self.wakeTask = nil
             if self.isChecking { self.requestAutomaticCheck() }
-            else if let last = self.lastAttempt, Date().timeIntervalSince(last) < self.interval {
+            else if let last = self.lastAttempt, Date().timeIntervalSince(last) < self.effectiveInterval {
                 self.scheduleNext(from: last)
             } else { self.requestAutomaticCheck() }
             self.render()
@@ -485,7 +559,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             case .recovered(let incident):
                 identifier = "recovery-\(incident.id.uuidString)"
                 content.title = "Internet speed recovered"
-                let speed = recoverySpeed.map { "Download: \(Self.speed($0, threshold: self.threshold)) Mbps. " } ?? ""
+                let speed = recoverySpeed.map { "Download: \(Self.speed($0, threshold: self.effectiveThreshold)) Mbps. " } ?? ""
                 content.body = "\(speed)Observed: \(ISTDate.string(incident.endedAt ?? Date()))"
             }
             do {
@@ -505,8 +579,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     @objc private func about() {
         let alert = NSAlert()
-        alert.messageText = "SpeedSentry \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1")"
-        alert.informativeText = "A lightweight download speed monitor for your menu bar.\n\nDefault: every 10 minutes; alert below 20 Mbps. A check starts with 8 MiB from Cloudflare. Fast results get a separate 64 MiB confirmation to reduce short-burst inflation. At most 72 MiB/check (about 10.9 GB/day if awake all day). Slower checks use only 8 MiB.\n\nLow Data Mode uses one 8 MiB sample (about 1.2 GB/day), with less protection against short speed bursts. Changes apply to the next check.\n\nThis is an estimate of the tested path, not an ISP plan guarantee. Brief drops between checks may be missed. No checks run during sleep. Failed probes do not prove an ISP outage.\n\nHistory stays on this Mac for 90 days. All displayed/exported incident times use IST (Asia/Kolkata). Cloudflare receives your IP as the test provider.\n\nHold Command and drag the menu bar item to reposition it. macOS controls its exact placement."
+        alert.messageText = "SpeedSentry \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0")"
+        alert.informativeText = "Download checks use up to 72 MiB (8 MiB in Low Data Mode). Smart Schedule checks speed hourly, about 1.8 GB/day maximum payload if continuously awake; fixed ten-minute checks can use 10.9 GB/day. One-minute connection checks use small HTTPS requests; their response time includes DNS, TLS and server time, and is not ICMP ping.\n\nUploads run only on demand and send 4 MiB of generated data to Cloudflare. Metered networks and paused profiles block full tests. Profiles can match a Wi-Fi name when macOS exposes it, otherwise select manually.\n\nDownload, upload and incident history stays local for 90 days; raw connection samples for seven days. All displayed/exported times use IST. Cloudflare and Apple receive your IP during connection tests. No tests during sleep. Brief drops can be missed. Hold Command and drag to reposition the menu bar item."
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
@@ -533,5 +607,197 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private static func thresholdText(_ value: Double) -> String {
         let text = String(value)
         return text.hasSuffix(".0") ? String(text.dropLast(2)) : text
+    }
+}
+
+extension AppDelegate {
+    private func refreshDashboard() {
+        dashboardModel.history = store?.history ?? HistorySnapshot()
+        if preview {
+            let now = Date()
+            var samples: [SpeedSentryCore.Measurement] = []
+            for i in 0..<168 {
+                let date = now.addingTimeInterval(Double(i - 167) * 3600)
+                let speed: Double = i % 31 == 0 ? 14 : Double(80 + i % 23)
+                samples.append(SpeedSentryCore.Measurement(timestamp: date, megabitsPerSecond: speed, bytesReceived: SpeedProbe.downloadBytes, errorDescription: nil))
+            }
+            dashboardModel.history = HistorySnapshot(measurements: samples)
+        }
+        dashboardModel.insights = insights?.snapshot ?? InsightsSnapshot()
+        dashboardModel.threshold = effectiveThreshold
+    }
+    @objc private func showDashboard() {
+        refreshDashboard()
+        if dashboardWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 730), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.title = "SpeedSentry · History & Reports (IST)"
+            window.isReleasedWhenClosed = false
+            window.contentView = NSHostingView(rootView: DashboardView(model: dashboardModel, export: { [weak self] report in self?.exportReport(report) }))
+            window.center(); dashboardWindow = window
+        }
+        NSApp.activate(ignoringOtherApps: true); dashboardWindow?.makeKeyAndOrderFront(nil)
+    }
+    private func exportReport(_ report: DailyReport) {
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "SpeedSentry-\(String(ISTDate.string(report.start).prefix(10)))-IST.txt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try report.text.write(to: url, atomically: true, encoding: .utf8) }
+        catch { showError("Report export failed", error.localizedDescription) }
+    }
+    @objc private func toggleSmartSchedule() {
+        smartSchedule.toggle(); scheduleNext(from: lastAttempt ?? Date()); render()
+    }
+    private func startConnectionMonitoring() {
+        connectionTimer?.invalidate()
+        guard !preview, !paused, !isSleeping, storageError == nil, insights != nil else { return }
+        runConnectionCheck()
+        let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.runConnectionCheck() }
+        }
+        timer.tolerance = 5; RunLoop.main.add(timer, forMode: .common); connectionTimer = timer
+    }
+    private func stopConnectionMonitoring() {
+        connectionTimer?.invalidate(); connectionTimer = nil
+        connectionTask?.cancel(); connectionTask = nil
+        uploadTask?.cancel(); uploadTask = nil
+        connectionFailures = 0
+        do { try insights?.interrupt() } catch { insightsFailed(error) }
+    }
+    private func runConnectionCheck() {
+        render() // Refresh staleness even when full tests are blocked.
+        guard !preview, !paused, !isSleeping, !isChecking, uploadTask == nil, connectionTask == nil, storageError == nil else { return }
+        let token = generation
+        connectionTask = Task { [weak self] in
+            let sample = await ConnectionProbe().measure()
+            guard let self, !Task.isCancelled, token == self.generation else { return }
+            self.connectionTask = nil; self.latestConnection = sample
+            self.connectionFailures = sample.reachable ? 0 : self.connectionFailures + 1
+            do {
+                let event = try self.insights?.record(sample)
+                if let event { self.notifyConnection(event) }
+                self.refreshDashboard()
+            } catch { self.insightsFailed(error); return }
+            if self.smartSchedule, MonitoringPolicy.shouldEscalate(failures: self.connectionFailures,
+                latencyMilliseconds: sample.latencyMilliseconds, lastSpeedAttempt: self.lastAttempt, now: sample.timestamp) {
+                self.requestAutomaticCheck()
+            }
+            self.render()
+        }
+    }
+    private func insightsFailed(_ error: Error) {
+        insights = nil
+        storageError = "Insights (restart to retry): \(error.localizedDescription)"
+        timer?.invalidate(); connectionTimer?.invalidate(); nextCheck = nil
+        render()
+    }
+    private func notifyConnection(_ event: ConnectionEvent) {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.notificationAuthorizationTask?.value
+            let settings = await UNUserNotificationCenter.current().notificationSettings()
+            guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return }
+            let content = UNMutableNotificationContent()
+            let id: String
+            switch event {
+            case .started(let outage):
+                id = "connection-\(outage.id)"; content.title = "Connection checks are failing"
+                content.body = "Both test providers failed twice. First observed: \(ISTDate.string(outage.startedAt)). Check Wi-Fi, VPN or your ISP."
+                content.sound = .default
+            case .recovered(let outage):
+                id = "connection-recovery-\(outage.id)"; content.title = "Connection checks recovered"
+                content.body = "Observed: \(ISTDate.string(outage.endedAt ?? Date()))"
+            }
+            do { try await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil)) }
+            catch { self.notificationError = error.localizedDescription }
+        }
+    }
+    @objc private func testUpload() {
+        guard !preview, !isSleeping, !isChecking, uploadTask == nil, !speedTestsBlocked, store != nil, insights != nil else { return }
+        connectionTask?.cancel(); connectionTask = nil
+        let token = generation
+        uploadTask = Task { [weak self] in
+            let result = await UploadProbe().measure()
+            guard let self, !Task.isCancelled, token == self.generation else { return }
+            self.uploadTask = nil
+            do { try self.insights?.record(result); self.refreshDashboard() }
+            catch { self.insightsFailed(error) }
+            self.render()
+            if self.pendingAutomaticCheck { self.pendingAutomaticCheck = false; self.requestAutomaticCheck() }
+            else if self.nextCheck.map({ $0 <= Date() }) ?? true { self.scheduleNext() }
+            self.showDashboard()
+        }
+        render()
+    }
+    private func startNetworkMonitoring() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let kind = path.usesInterfaceType(.wifi) ? "Wi-Fi" : path.usesInterfaceType(.wiredEthernet) ? "Ethernet" : "Other network"
+            let metered = path.isExpensive || path.isConstrained
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let ssid = path.usesInterfaceType(.wifi) ? CWWiFiClient.shared().interface()?.ssid() : nil
+                let identity = "\(kind)|\(ssid ?? "unknown")|\(metered)"
+                self.currentSSID = ssid; self.networkName = ssid ?? kind
+                self.expensiveNetwork = metered
+                guard self.networkIdentity != identity else { return }
+                let wasKnown = self.networkIdentity != nil
+                self.networkIdentity = identity
+                if wasKnown { self.networkSettingsChanged() }
+                else if !self.paused {
+                    self.startConnectionMonitoring()
+                    if !self.speedTestsBlocked { self.checkNow() }
+                }
+                self.render()
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "app.speedsentry.network"))
+    }
+    private func networkSettingsChanged() {
+        generation += 1; pendingAutomaticCheck = false
+        checkTask?.cancel(); probe.cancel()
+        stopConnectionMonitoring(); latestConnection = nil
+        timer?.invalidate(); nextCheck = nil
+        startConnectionMonitoring()
+        scheduleNext(from: lastAttempt ?? Date())
+        refreshDashboard(); render()
+    }
+    @objc private func selectProfile(_ sender: NSMenuItem) {
+        guard !preview else { return }
+        let id = sender.representedObject as? String ?? ""
+        // Selecting Default also removes automatic matching for this SSID.
+        if let ssid = currentSSID {
+            profiles = profiles.map { profile in
+                var updated = profile
+                if profile.ssid == ssid { updated.ssid = nil }
+                if profile.id.uuidString == id { updated.ssid = ssid }
+                return updated
+            }
+        }
+        defaults.set(id, forKey: "manualProfileID"); networkSettingsChanged()
+    }
+    @objc private func editProfile() {
+        let existing = activeProfile
+        let alert = NSAlert(); alert.messageText = existing == nil ? "New network profile" : "Edit network profile"
+        alert.informativeText = "Set a download alert threshold and pause full tests for hotspots.\n\(currentSSID == nil ? "Wi-Fi name unavailable: select this profile manually after changing networks." : "Matches current Wi-Fi name automatically when macOS exposes it.")"
+        let name = NSTextField(string: existing?.name ?? networkName)
+        let thresholdField = NSTextField(string: Self.thresholdText(existing?.thresholdMbps ?? threshold))
+        let pause = NSButton(checkboxWithTitle: "Pause download and upload tests", target: nil, action: nil)
+        pause.state = existing?.pauseSpeedTests == true ? .on : .off
+        let stack = NSStackView(views: [NSTextField(labelWithString: "Profile name"), name, NSTextField(labelWithString: "Alert below (Mbps)"), thresholdField, pause])
+        stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 360, height: 150); name.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        thresholdField.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        alert.accessoryView = stack; alert.addButton(withTitle: "Save"); alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let value = Double(thresholdField.stringValue) else { showError("Invalid threshold", "Enter a number greater than 0 and up to 10,000 Mbps."); return }
+        let profile = NetworkProfile(id: existing?.id ?? UUID(), name: name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), ssid: currentSSID, thresholdMbps: value, pauseSpeedTests: pause.state == .on)
+        guard profile.isValid else { showError("Invalid profile", "Enter a name and a threshold greater than 0 and up to 10,000 Mbps."); return }
+        profiles = profiles.filter { $0.id != profile.id && (currentSSID == nil || $0.ssid != currentSSID) } + [profile]
+        defaults.set(profile.id.uuidString, forKey: "manualProfileID"); networkSettingsChanged()
+    }
+    @objc private func deleteProfile() {
+        guard let profile = activeProfile else { return }
+        profiles = profiles.filter { $0.id != profile.id }; defaults.removeObject(forKey: "manualProfileID")
+        networkSettingsChanged()
     }
 }

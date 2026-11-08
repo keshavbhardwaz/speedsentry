@@ -6,15 +6,15 @@ CONFIGURATION=release
 UNIVERSAL=0
 IDENTITY="-"
 OUTPUT="$ROOT/dist/SpeedSentry.app"
-VERSION="${VERSION:-0.1.1}"
-BUILD_NUMBER="${BUILD_NUMBER:-2}"
+VERSION="${VERSION:-0.2.0}"
+BUILD_NUMBER="${BUILD_NUMBER:-3}"
 
 usage() {
   cat <<'USAGE'
 Usage: bash scripts/build-app.sh [--configuration debug|release] [--universal]
                             [--identity 'Developer ID Application: …'] [--output PATH]
                             [--disable-swift-sandbox]
-Environment: VERSION (default 0.1.1), BUILD_NUMBER (default 2).
+Environment: VERSION (default 0.2.0), BUILD_NUMBER (default 3).
 The app compiles directly with Apple's Swift compiler; SwiftPM is used only for tests/IDE.
 --disable-swift-sandbox is accepted for compatibility and has no effect.
 The default ad hoc signature is for development on your own Mac.
@@ -70,7 +70,7 @@ build_arch() {
     -emit-module-path "$scratch/SpeedSentryCore.swiftmodule" -o "$scratch/SpeedSentryCore.o" \
     "$ROOT"/Sources/SpeedSentryCore/*.swift >&2 || return $?
   xcrun swiftc "${swift_args[@]}" -I "$scratch" \
-    "$ROOT/Sources/SpeedSentry/main.swift" "$ROOT/Sources/SpeedSentry/AppDelegate.swift" \
+    "$ROOT"/Sources/SpeedSentry/*.swift \
     "$scratch/SpeedSentryCore.o" -o "$scratch/SpeedSentry" >&2 || return $?
   printf '%s\n' "$scratch"
 }
