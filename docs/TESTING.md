@@ -44,3 +44,9 @@ Manual UI checks:
 - Confirm stale download results receive a dot in the menu bar and an explicit menu/tooltip label. Full checks never prevent sleep.
 
 Local validation does not substitute for Intel hardware, notification delivery under Focus, login-item behavior after logout, or long-duration sleep/network-switch testing.
+
+## Wi-Fi signal verification
+
+Run `bash scripts/validate-wifi-signal.sh` for native, offline policy checks on a CLT-only Mac. The same scenarios run under XCTest in CI. Coverage includes RSSI quality boundaries, zero/invalid values, sustained weak observations, rapid menu polling, recovery hysteresis, interrupted observations, unavailable data, network changes and reset/threshold preferences.
+
+Verify on a Wi-Fi-connected Mac that the menu/dashboard show dBm and a checked-at IST timestamp. No radio scan or internet payload is required. Use a synthetic preview to inspect the large warning and Dismiss action without moving/disconnecting the user's real network. In real use, a threshold crossing should show one nonactivating floating warning with the move-closer/switch-network message; dismissal must not reopen it until sustained recovery followed by a new weak episode. Recovery, pause, sleep and disabling alerts hide the warning. Metered/profile pauses block speed tests but keep signal monitoring active; the global Pause Monitoring option stops both.

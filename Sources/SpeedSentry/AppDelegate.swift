@@ -22,6 +22,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var expensiveNetwork = false
     private var connectionFailures = 0
     private var latestConnection: ConnectionSample?
+    private var usingWiFi = false
+    private var wifiInterfaceName: String?
+    private var wifiTimer: Timer?
+    private var wifiReading = WiFiSignalReading(state: .unavailable)
+    private var wifiPolicy = WiFiSignalPolicy()
+    private var wifiWarningPanel: NSPanel?
+    private var wifiAlertsEnabled: Bool {
+        get { defaults.object(forKey: "wifiSignalAlertsEnabled") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "wifiSignalAlertsEnabled") }
+    }
+    private var wifiThreshold: Int {
+        get { let value = defaults.integer(forKey: "wifiWeakThresholdDBm"); return [-70, -75, -80].contains(value) ? value : -75 }
+        set { defaults.set(newValue, forKey: "wifiWeakThresholdDBm") }
+    }
+    private var wifiIsWeak: Bool { wifiPolicy.activeEpisode != nil && wifiReading.rssiDBm != nil }
     private var dashboardWindow: NSWindow?
     private let dashboardModel = DashboardModel()
     private var smartSchedule: Bool {
@@ -137,11 +152,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         checkTask?.cancel()
         probe.cancel()
         connectionTask?.cancel(); uploadTask?.cancel(); connectionTimer?.invalidate(); pathMonitor.cancel()
+        wifiTimer?.invalidate(); wifiWarningPanel?.orderOut(nil)
         try? insights?.interrupt()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        if !preview, !paused, !isSleeping { updateWiFiSignal() }
         rebuildMenu()
         if !preview { refreshNotificationStatus() }
     }
@@ -182,19 +199,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             title = "—"
             color = .labelColor
         }
-        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "SpeedSentry download speed")
+        let displaySymbol = wifiIsWeak && !paused && !isSleeping && storageError == nil && connectionFailures < 2 ? "wifi.exclamationmark" : symbol
+        button.image = NSImage(systemSymbolName: displaySymbol, accessibilityDescription: "SpeedSentry download speed")
         button.imagePosition = .imageLeading
-        button.contentTintColor = color
+        button.contentTintColor = wifiIsWeak && !paused && !isSleeping ? .systemOrange : color
         button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        button.title = " \(title)"
-        button.setAccessibilityLabel("SpeedSentry: \(title)\(stale ? ", stale result" : "")")
+        button.title = " \(title)\(wifiIsWeak && !paused && !isSleeping ? " · Wi-Fi!" : "")"
+        button.setAccessibilityLabel("SpeedSentry: \(title)\(stale ? ", stale result" : ""), Wi-Fi: \(wifiReading.summary)")
         let last = latest.map { ISTDate.string($0.timestamp) } ?? "No checks yet"
-        button.toolTip = "SpeedSentry · Download Mbps\nLast check: \(last)\nAlert below \(Self.thresholdText(effectiveThreshold)) Mbps · Every \(Int(effectiveInterval / 60)) minutes\n\(stale ? "Result is stale" : "Result is recent") · \(networkName)"
+        button.toolTip = "SpeedSentry · Download Mbps\nLast check: \(last)\nAlert below \(Self.thresholdText(effectiveThreshold)) Mbps · Every \(Int(effectiveInterval / 60)) minutes\n\(stale ? "Result is stale" : "Result is recent") · \(networkName)\nWi-Fi signal: \(wifiReading.summary)"
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
         label("SpeedSentry", bold: true)
+        label("Wi-Fi signal: \(wifiReading.summary)")
+        if wifiIsWeak { label("Move closer to the access point or switch Wi-Fi networks") }
         label("Network: \(networkName) · Profile: \(activeProfile?.name ?? "Default")")
         if speedTestsBlocked { label("Full tests paused on this profile or metered network") }
         if stale, latest != nil { label("Download result is stale · run Check Now to refresh") }
@@ -278,6 +298,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         submenu("Network Profiles", profileMenu)
         action("Add / Edit Current Network Profile…", #selector(editProfile), enabled: !preview)
         action("Delete Active Profile", #selector(deleteProfile), enabled: !preview && activeProfile != nil)
+        action("Wi-Fi Signal Alerts", #selector(toggleWiFiAlerts), enabled: !preview, checked: wifiAlertsEnabled)
+        let wifiThresholds = NSMenu()
+        for value in [-70, -75, -80] {
+            let item = NSMenuItem(title: "\(value) dBm or lower", action: #selector(setWiFiThreshold(_:)), keyEquivalent: "")
+            item.target = self; item.tag = value; item.state = wifiThreshold == value ? .on : .off; item.isEnabled = !preview
+            wifiThresholds.addItem(item)
+        }
+        submenu("Weak Wi-Fi Alert: \(wifiThreshold) dBm", wifiThresholds)
         action("Low Data Mode", #selector(toggleLowDataMode), enabled: !preview, checked: lowDataMode)
         action("Launch at Login", #selector(toggleLogin), enabled: !preview,
                checked: !preview && SMAppService.mainApp.status == .enabled)
@@ -580,7 +608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     @objc private func about() {
         let alert = NSAlert()
         alert.messageText = "SpeedSentry \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0")"
-        alert.informativeText = "Download checks use up to 72 MiB (8 MiB in Low Data Mode). Smart Schedule checks speed hourly, about 1.8 GB/day maximum payload if continuously awake; fixed ten-minute checks can use 10.9 GB/day. One-minute connection checks use small HTTPS requests; their response time includes DNS, TLS and server time, and is not ICMP ping.\n\nUploads run only on demand and send 4 MiB of generated data to Cloudflare. Metered networks and paused profiles block full tests. Profiles can match a Wi-Fi name when macOS exposes it, otherwise select manually.\n\nDownload, upload and incident history stays local for 90 days; raw connection samples for seven days. All displayed/exported times use IST. Cloudflare and Apple receive your IP during connection tests. No tests during sleep. Brief drops can be missed. Hold Command and drag to reposition the menu bar item."
+        alert.informativeText = "Download checks use up to 72 MiB (8 MiB in Low Data Mode). Smart Schedule checks speed hourly, about 1.8 GB/day maximum payload if continuously awake; fixed ten-minute checks can use 10.9 GB/day. One-minute connection checks use small HTTPS requests; their response time includes DNS, TLS and server time, and is not ICMP ping.\n\nWi-Fi signal is read locally every 10 seconds while monitoring. Two readings at or below the selected threshold show one large warning; two readings 8 dBm above the threshold clear it. macOS may make readings unavailable. No Wi-Fi scans or automatic network switches run.\n\nUploads run only on demand and send 4 MiB of generated data to Cloudflare. Metered networks and paused profiles block full tests. Profiles can match a Wi-Fi name when macOS exposes it, otherwise select manually.\n\nDownload, upload and incident history stays local for 90 days; raw connection samples for seven days. All displayed/exported times use IST. Cloudflare and Apple receive your IP during connection tests. No tests during sleep. Brief drops can be missed. Hold Command and drag to reposition the menu bar item."
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
@@ -625,6 +653,8 @@ extension AppDelegate {
         }
         dashboardModel.insights = insights?.snapshot ?? InsightsSnapshot()
         dashboardModel.threshold = effectiveThreshold
+        dashboardModel.wifi = wifiReading
+        dashboardModel.wifiEpisode = wifiPolicy.activeEpisode
     }
     @objc private func showDashboard() {
         refreshDashboard()
@@ -650,6 +680,7 @@ extension AppDelegate {
     private func startConnectionMonitoring() {
         connectionTimer?.invalidate()
         guard !preview, !paused, !isSleeping, storageError == nil, insights != nil else { return }
+        startWiFiSignalMonitoring()
         runConnectionCheck()
         let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in self?.runConnectionCheck() }
@@ -657,6 +688,7 @@ extension AppDelegate {
         timer.tolerance = 5; RunLoop.main.add(timer, forMode: .common); connectionTimer = timer
     }
     private func stopConnectionMonitoring() {
+        stopWiFiSignalMonitoring()
         connectionTimer?.invalidate(); connectionTimer = nil
         connectionTask?.cancel(); connectionTask = nil
         uploadTask?.cancel(); uploadTask = nil
@@ -736,6 +768,8 @@ extension AppDelegate {
                 guard let self else { return }
                 let ssid = path.usesInterfaceType(.wifi) ? CWWiFiClient.shared().interface()?.ssid() : nil
                 let identity = "\(kind)|\(ssid ?? "unknown")|\(metered)"
+                self.usingWiFi = path.usesInterfaceType(.wifi)
+                self.wifiInterfaceName = path.availableInterfaces.first(where: { $0.type == .wifi })?.name
                 self.currentSSID = ssid; self.networkName = ssid ?? kind
                 self.expensiveNetwork = metered
                 guard self.networkIdentity != identity else { return }
@@ -799,5 +833,97 @@ extension AppDelegate {
         guard let profile = activeProfile else { return }
         profiles = profiles.filter { $0.id != profile.id }; defaults.removeObject(forKey: "manualProfileID")
         networkSettingsChanged()
+    }
+}
+
+extension AppDelegate {
+    private func startWiFiSignalMonitoring() {
+        wifiTimer?.invalidate()
+        guard !preview, !paused, !isSleeping else { return }
+        wifiPolicy = WiFiSignalPolicy(weakThresholdDBm: wifiThreshold)
+        updateWiFiSignal()
+        let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.updateWiFiSignal() }
+        }
+        timer.tolerance = 1
+        RunLoop.main.add(timer, forMode: .common); wifiTimer = timer
+    }
+    private func stopWiFiSignalMonitoring() {
+        wifiTimer?.invalidate(); wifiTimer = nil
+        clearWiFiWarning(); wifiPolicy.reset()
+        wifiReading = WiFiSignalReading(state: paused || isSleeping ? .paused : .unavailable)
+        dashboardModel.wifi = wifiReading; dashboardModel.wifiEpisode = nil
+    }
+    private func updateWiFiSignal() {
+        guard !preview, !paused, !isSleeping else { return }
+        let observation = WiFiSignalReader.read(usingWiFi: usingWiFi, interfaceName: wifiInterfaceName)
+        wifiReading = observation.reading
+        let previousEpisode = wifiPolicy.activeEpisode
+        let event: WiFiSignalEvent?
+        if wifiAlertsEnabled { event = wifiPolicy.observe(wifiReading, networkID: observation.networkID) }
+        else { wifiPolicy.reset(); event = nil }
+        dashboardModel.wifi = wifiReading; dashboardModel.wifiEpisode = wifiPolicy.activeEpisode
+        if !wifiIsWeak { wifiWarningPanel?.orderOut(nil) }
+        if wifiPolicy.activeEpisode == nil, let previousEpisode {
+            removeWiFiNotification(previousEpisode.id)
+        }
+        if case .started(let episode) = event {
+            showWiFiWarning()
+            notifyWeakWiFi(episode)
+        }
+        render()
+    }
+    private func showWiFiWarning() {
+        if wifiWarningPanel == nil {
+            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 596, height: 300), styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
+            panel.title = "SpeedSentry · Weak Wi-Fi"
+            panel.level = .floating
+            panel.hidesOnDeactivate = false
+            panel.isReleasedWhenClosed = false
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.contentView = NSHostingView(rootView: WiFiWeakWarningView(model: dashboardModel, dismiss: { [weak panel] in panel?.orderOut(nil) }))
+            wifiWarningPanel = panel
+        }
+        wifiWarningPanel?.center()
+        wifiWarningPanel?.orderFrontRegardless()
+    }
+    private func notifyWeakWiFi(_ episode: WiFiWeakEpisode) {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.notificationAuthorizationTask?.value
+            guard self.wifiAlertsEnabled, self.wifiPolicy.activeEpisode?.id == episode.id, self.wifiIsWeak else { return }
+            let center = UNUserNotificationCenter.current()
+            let settings = await center.notificationSettings()
+            guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional,
+                  self.wifiAlertsEnabled, !self.paused, !self.isSleeping,
+                  self.wifiPolicy.activeEpisode?.id == episode.id, self.wifiIsWeak else { return }
+            let content = UNMutableNotificationContent()
+            content.title = "Wi-Fi signal is weak"
+            content.body = "\(episode.rssiDBm) dBm. Move closer to your Wi-Fi access point or switch to a stronger Wi-Fi network. First observed: \(ISTDate.string(episode.startedAt))."
+            content.sound = .default
+            do { try await center.add(UNNotificationRequest(identifier: "weak-wifi-\(episode.id)", content: content, trigger: nil)) }
+            catch { self.notificationError = error.localizedDescription }
+        }
+    }
+    private func removeWiFiNotification(_ id: UUID) {
+        let identifier = "weak-wifi-\(id)"
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
+        center.removePendingNotificationRequests(withIdentifiers: [identifier])
+    }
+    private func clearWiFiWarning() {
+        wifiWarningPanel?.orderOut(nil)
+        if let episode = wifiPolicy.activeEpisode { removeWiFiNotification(episode.id) }
+    }
+    @objc private func toggleWiFiAlerts() {
+        guard !preview else { return }
+        wifiAlertsEnabled.toggle(); clearWiFiWarning(); wifiPolicy.reset()
+        updateWiFiSignal()
+    }
+    @objc private func setWiFiThreshold(_ sender: NSMenuItem) {
+        guard !preview, [-70, -75, -80].contains(sender.tag) else { return }
+        clearWiFiWarning(); wifiThreshold = sender.tag
+        wifiPolicy = WiFiSignalPolicy(weakThresholdDBm: wifiThreshold)
+        updateWiFiSignal()
     }
 }
