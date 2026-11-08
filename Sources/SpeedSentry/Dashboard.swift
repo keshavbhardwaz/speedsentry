@@ -8,6 +8,8 @@ final class DashboardModel: ObservableObject {
     @Published var history = HistorySnapshot()
     @Published var insights = InsightsSnapshot()
     @Published var threshold = 20.0
+    @Published var wifi = WiFiSignalReading(state: .unavailable)
+    @Published var wifiEpisode: WiFiWeakEpisode?
     @Published var days = 7
     @Published var day = Date()
 }
@@ -34,6 +36,7 @@ struct DashboardView: View {
                         Text("24 hours").tag(1); Text("7 days").tag(7); Text("30 days").tag(30)
                     }.frame(width: 160)
                 }
+                WiFiSignalCard(reading: model.wifi, warning: model.wifiEpisode != nil && model.wifi.rssiDBm != nil)
                 if samples.isEmpty { Text("No download samples in this period. Run Check Now to get started.").padding() }
                 else {
                     Chart {

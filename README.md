@@ -28,6 +28,7 @@ The local build has an ad hoc signature for use on your own Mac. It is not the s
 - **Network Profiles**: per-network thresholds and full-test pause; system-metered networks automatically block full tests. Select profiles manually when macOS hides Wi-Fi names.
 - **Test Upload Now**: one explicit 4 MiB generated upload and a conservative whole-request estimate.
 - Visible stale-result state, current network/profile and latest connection/upload status.
+- Wi-Fi signal strength in dBm with a dashboard indicator and a large, dismissible weak-signal warning recommending moving closer or switching Wi-Fi networks. Alerts are configurable and avoid repeats until recovery.
 
 Your existing schedule, threshold and history remain. Smart Schedule is off until you select it. See [network insights](docs/NETWORK-INSIGHTS.md) for limits, privacy and data use.
 
@@ -82,6 +83,7 @@ make build                 # Native-architecture release app, ad hoc signature
 make universal             # Apple silicon + Intel app, ad hoc signature
 bash ./scripts/build-app.sh --configuration debug
 bash scripts/validate-insights.sh       # Native local regressions, no XCTest required
+bash scripts/validate-wifi-signal.sh    # Offline signal/alert lifecycle checks
 bash scripts/validate-probe-accuracy.sh # Controlled loopback accuracy tests
 ```
 
