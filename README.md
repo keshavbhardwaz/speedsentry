@@ -63,7 +63,7 @@ History stays in `~/Library/Application Support/SpeedSentry/`; settings use macO
 
 ## Homebrew distribution
 
-The Homebrew formula builds version **0.1.1** from source on the installing Mac. Source lives in [`keshavbhardwaz/speedsentry`](https://github.com/keshavbhardwaz/speedsentry), with the formula in [`keshavbhardwaz/homebrew-tap`](https://github.com/keshavbhardwaz/homebrew-tap). Install and launch with:
+The Homebrew formula builds version **0.2.0** from source on the installing Mac. Source lives in [`keshavbhardwaz/speedsentry`](https://github.com/keshavbhardwaz/speedsentry), with the formula in [`keshavbhardwaz/homebrew-tap`](https://github.com/keshavbhardwaz/homebrew-tap). Install and launch with:
 
 ```sh
 brew install keshavbhardwaz/tap/speedsentry

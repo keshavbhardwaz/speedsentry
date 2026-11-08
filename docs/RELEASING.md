@@ -2,7 +2,7 @@
 
 The selected source repository is `keshavbhardwaz/speedsentry`, with a formula in `keshavbhardwaz/homebrew-tap`. The initial distribution builds locally using Apple's Swift compiler. A precompiled signed cask can be added when a Developer ID certificate becomes available. Signing secrets must never be committed.
 
-For 0.1.1, release notes and installation guidance must disclose adaptive data use: default mode can download 8 + 64 MiB per check, about 10.9 GB/day at 10-minute intervals while continuously awake. Low Data Mode uses 8 MiB per check, about 1.2 GB/day, with greater sensitivity to short transfer bursts. Verify both modes before publication.
+Release notes and installation guidance must disclose adaptive data use: default mode can download 8 + 64 MiB per check, about 10.9 GB/day at 10-minute intervals while continuously awake. Low Data Mode uses 8 MiB per check, about 1.2 GB/day, with greater sensitivity to short transfer bursts. Verify both modes before publication.
 
 ## Source release
 
@@ -11,13 +11,13 @@ Push this directory's contents as the root of the `speedsentry` repository. If i
 After the main branch passes CI, tag the exact commit to release:
 
 ```sh
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 Only the read-only CI workflow is active. Source-release and signed-release workflows are stored as **inactive templates** in `docs/workflow-templates/`; GitHub does not run them there. Source releases are published explicitly using authenticated GitHub CLI commands below. No Apple signing credentials are required for source distribution. Release tags must use `vX.Y.Z`; do not move a published tag to a different commit.
 
-The formula must point at the real tagged source archive with its actual checksum. Generate it after the tag is available, publish the release, then copy it into the tap as **`Formula/speedsentry.rb`** and commit and push the tap.
+The formula must point at the real tagged source archive with its actual checksum. Generate it after the tag is available, publish the release, then copy it into the tap as **`Formula/speedsentry.rb`** and commit and push the tap. The generated formula is distribution metadata in the tap and does not need to be duplicated as a release asset.
 
 ```sh
 brew install keshavbhardwaz/tap/speedsentry
@@ -30,7 +30,7 @@ To generate the formula manually after the tag is live:
 
 ```sh
 repository=keshavbhardwaz/speedsentry
-version=0.1.1
+version=0.2.0
 mkdir -p dist
 curl --fail --location --retry 3 \
   "https://github.com/$repository/archive/refs/tags/v$version.tar.gz" \
@@ -41,11 +41,13 @@ bash ./scripts/generate-formula.sh --repository "$repository" --version "$versio
 ruby -c dist/Formula/speedsentry.rb
 ```
 
-Publish the source release explicitly after authenticating with `gh auth login`:
+Write the checksum into a small manifest, then publish only the custom tarball and checksum. GitHub adds its standard **Source code (zip)** and **Source code (tar.gz)** links automatically, so a second custom ZIP is unnecessary.
 
 ```sh
+printf '%s  %s\n' "$checksum" "SpeedSentry-$version-source.tar.gz" \
+  > "dist/SHA256SUMS-$version"
 gh release create "v$version" "dist/SpeedSentry-$version-source.tar.gz" \
-  dist/Formula/speedsentry.rb --repo "$repository" --verify-tag \
+  "dist/SHA256SUMS-$version" --repo "$repository" --verify-tag \
   --title "SpeedSentry $version" --generate-notes
 ```
 
@@ -68,9 +70,9 @@ Create an Apple **Developer ID Application** certificate with its private key, a
 | `APPLE_TEAM_ID` | Apple developer team identifier |
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for notarization |
 
-The optional signed-release template is inactive at `docs/workflow-templates/release.yml`. To opt in later, review its write permissions and secret access, copy it to `.github/workflows/release.yml`, and commit that deliberate change. Then run **Signed macOS release** manually in GitHub Actions and supply the existing tag, for example `v0.1.1`. You can add required reviewers to the environment. The workflow tests, imports the identity into a temporary keychain, builds Apple silicon and Intel executables, combines them into a universal binary, signs with hardened runtime, submits using `notarytool`, staples Apple's ticket, and validates Gatekeeper assessment. It recreates the ZIP after stapling and checksums that exact ZIP. Credentials are removed in cleanup.
+The optional signed-release template is inactive at `docs/workflow-templates/release.yml`. To opt in later, review its write permissions and secret access, copy it to `.github/workflows/release.yml`, and commit that deliberate change. Then run **Signed macOS release** manually in GitHub Actions and supply an existing tag, for example `v0.2.0`. You can add required reviewers to the environment. The workflow tests, imports the identity into a temporary keychain, builds Apple silicon and Intel executables, combines them into a universal binary, signs with hardened runtime, submits using `notarytool`, staples Apple's ticket, and validates Gatekeeper assessment. It recreates the ZIP after stapling and checksums that exact ZIP. Credentials are removed in cleanup.
 
-It adds `SpeedSentry-0.1.1-universal.zip`, its `.sha256`, and `speedsentry-cask.rb` to the release. Assets are not silently replaced. Copy the cask into the tap as `Casks/speedsentry.rb`, removing the formula of the same name when you migrate distribution, then install with:
+It adds `SpeedSentry-X.Y.Z-universal.zip`, its `.sha256`, and `speedsentry-cask.rb` to the release. Assets are not silently replaced. Copy the cask into the tap as `Casks/speedsentry.rb`, removing the formula of the same name when you migrate distribution, then install with:
 
 ```sh
 brew install --cask keshavbhardwaz/tap/speedsentry
@@ -82,7 +84,7 @@ Apple documents [Developer ID distribution and notarization](https://developer.a
 For a local signed build, set `SIGNING_IDENTITY` to your certificate identity and `NOTARY_PROFILE` to an existing `notarytool` keychain credential profile, then run:
 
 ```sh
-export VERSION=0.1.1
+export VERSION=0.2.0
 bash ./scripts/build-app.sh --universal --identity "$SIGNING_IDENTITY"
 bash ./scripts/package-release.sh dist/SpeedSentry.app \
   "dist/SpeedSentry-$VERSION-universal.zip" --keychain-profile "$NOTARY_PROFILE"
