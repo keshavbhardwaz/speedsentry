@@ -2,7 +2,7 @@ import AppKit
 import SpeedSentryCore
 
 if CommandLine.arguments.contains("--version") {
-    print("SpeedSentry \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1")")
+    print("SpeedSentry \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0")")
 } else if CommandLine.arguments.contains("--probe-once") {
     // A diagnostic command: one real, capped download, no app or notification permission.
     Task {

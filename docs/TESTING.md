@@ -26,3 +26,21 @@ For the 0.1.1 accuracy patch, use the [measurement methodology and verification 
 **Login item unavailable:** Run the app bundle from a stable installed location, preferably `/Applications`. Check macOS Login Items for an approval request. Launch at login is user-controlled and off by default.
 
 **Gatekeeper rejects a downloaded development ZIP:** Use a properly Developer ID signed and notarized release. Local ad hoc builds are for development on the building Mac.
+
+## 0.2.0 network insights
+
+On a Command Line Tools-only Mac, run `bash scripts/validate-insights.sh` and `bash scripts/validate-probe-accuracy.sh`. These compile real native regression executables, require no XCTest shim, write only temporary data, and do not contact the internet. The paced accuracy suite needs permission to bind a loopback socket. `InsightsScenarios.swift` also runs unchanged through XCTest on CI.
+
+For optional live checks (4 MiB generated upload, no personal files), compile `Sources/SpeedSentryCore/*.swift` with `scripts/LiveProbeCheck.swift` using `swiftc -parse-as-library`, then run the executable. Results depend on your network; upload uses whole-request elapsed time and can reflect short ISP bursts.
+
+Manual UI checks:
+
+- Launch with `--preview`: synthetic seven-day download history, no monitoring, preferences, notifications or real history writes. Open History & Daily Reports, switch 24 hours / seven / 30 days, select a report day and export a text report. Preview report exports are synthetic.
+- Smart Schedule is opt-in. Check that it changes the next speed check to hourly and retains one-minute connection checks. Restore fixed schedule to preserve your existing interval.
+- Set up two profiles, switch manually, check their effective thresholds. macOS may conceal SSIDs; no location access is requested. Known SSID matches override manual fallback. Default clears the current SSID binding. Check profile pause and metered/Low Data system-network flags block download and upload while connection checks continue.
+- Check upload blocks overlapping full tests and displays/stores its result. Pause, sleep or change profile during a transfer; cancelled results must not be logged against the next network.
+- Two consecutive failed connection checks (each trying both providers) open one alert. Repeated failures do not repeat it; one success recovers. Pause, sleep, restart or a gap over 150 seconds breaks outage continuity. A single provider failure must not declare an outage. The shown latency includes DNS/TLS/server time; it is not ICMP ping.
+- Inspect old `history.json` after upgrading. Its schema and existing records remain intact. New records use separate `insights.json`. A corrupt insights file must be preserved, with monitoring stopped and an error visible until restart/recovery.
+- Confirm stale download results receive a dot in the menu bar and an explicit menu/tooltip label. Full checks never prevent sleep.
+
+Local validation does not substitute for Intel hardware, notification delivery under Focus, login-item behavior after logout, or long-duration sleep/network-switch testing.

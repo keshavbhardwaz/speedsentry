@@ -123,7 +123,7 @@ public final class SpeedProbe: @unchecked Sendable {
         request.httpMethod = "GET"
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.setValue("no-cache, no-store", forHTTPHeaderField: "Cache-Control")
-        request.setValue("SpeedSentry/0.1.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("SpeedSentry/0.2.0", forHTTPHeaderField: "User-Agent")
         return request
     }
 
