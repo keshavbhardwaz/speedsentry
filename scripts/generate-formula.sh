@@ -70,7 +70,9 @@ class Speedsentry < Formula
 
   test do
     assert_path_exists prefix/"SpeedSentry.app/Contents/MacOS/SpeedSentry"
-    assert_match "app.speedsentry.mac", shell_output("/usr/bin/plutil -extract CFBundleIdentifier raw '#{prefix}/SpeedSentry.app/Contents/Info.plist'")
+    info_plist = prefix/"SpeedSentry.app/Contents/Info.plist"
+    bundle_id = shell_output("/usr/bin/plutil -extract CFBundleIdentifier raw '#{info_plist}'")
+    assert_match "app.speedsentry.mac", bundle_id
     system "/usr/bin/codesign", "--verify", "--strict", prefix/"SpeedSentry.app"
     assert_match "#{opt_prefix}/SpeedSentry.app", (bin/"speedsentry").read
   end
