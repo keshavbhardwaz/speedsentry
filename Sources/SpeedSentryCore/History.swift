@@ -5,12 +5,14 @@ public struct Measurement: Codable, Equatable, Sendable {
     public let megabitsPerSecond: Double?
     public let bytesReceived: Int
     public let errorDescription: String?
+    public let networkContext: NetworkContext?
 
-    public init(timestamp: Date, megabitsPerSecond: Double?, bytesReceived: Int, errorDescription: String?) {
+    public init(timestamp: Date, megabitsPerSecond: Double?, bytesReceived: Int, errorDescription: String?, networkContext: NetworkContext? = nil) {
         self.timestamp = timestamp
         self.megabitsPerSecond = megabitsPerSecond
         self.bytesReceived = bytesReceived
         self.errorDescription = errorDescription
+        self.networkContext = networkContext
     }
 }
 
@@ -26,14 +28,19 @@ public struct Incident: Codable, Equatable, Sendable, Identifiable {
     public var lowestMbps: Double?
     public let thresholdMbps: Double
     public var kind: IncidentKind
+    public var startNetworkContext: NetworkContext?
+    public var endNetworkContext: NetworkContext?
 
-    public init(id: UUID = UUID(), startedAt: Date, endedAt: Date? = nil, lowestMbps: Double?, thresholdMbps: Double, kind: IncidentKind) {
+    public init(id: UUID = UUID(), startedAt: Date, endedAt: Date? = nil, lowestMbps: Double?, thresholdMbps: Double, kind: IncidentKind,
+                startNetworkContext: NetworkContext? = nil, endNetworkContext: NetworkContext? = nil) {
         self.id = id
         self.startedAt = startedAt
         self.endedAt = endedAt
         self.lowestMbps = lowestMbps
         self.thresholdMbps = thresholdMbps
         self.kind = kind
+        self.startNetworkContext = startNetworkContext
+        self.endNetworkContext = endNetworkContext
     }
 }
 
@@ -150,13 +157,15 @@ public final class HistoryStore {
                     startedAt: measurement.timestamp,
                     lowestMbps: measurement.megabitsPerSecond,
                     thresholdMbps: thresholdMbps,
-                    kind: measurement.megabitsPerSecond == nil ? .unavailable : .slow
+                    kind: measurement.megabitsPerSecond == nil ? .unavailable : .slow,
+                    startNetworkContext: measurement.networkContext
                 )
                 updated.incidents.append(incident)
                 event = .started(incident)
             }
         } else if let index = activeIndex {
             updated.incidents[index].endedAt = measurement.timestamp
+            updated.incidents[index].endNetworkContext = measurement.networkContext
             event = .recovered(updated.incidents[index])
         }
 
@@ -168,20 +177,27 @@ public final class HistoryStore {
     }
 
     /// Exports sample and incident rows. All human-facing times explicitly use Asia/Kolkata.
-    public func exportCSV(to url: URL) throws {
+    public func exportCSV(to url: URL, networkChanges: [NetworkChange] = []) throws {
         var rows: [[String]] = [[
             "record_type", "timestamp_ist (Asia/Kolkata, UTC+05:30)", "download_mbps", "bytes_received", "error",
             "incident_id", "started_at_ist (Asia/Kolkata, UTC+05:30)", "ended_at_ist (Asia/Kolkata, UTC+05:30)",
-            "lowest_mbps", "threshold_mbps", "incident_kind"
+            "lowest_mbps", "threshold_mbps", "incident_kind",
+            "network_context", "start_network_context", "end_network_context"
         ]]
         rows += history.measurements.map { measurement in
             ["measurement", ISTDate.string(measurement.timestamp), Self.number(measurement.megabitsPerSecond),
-             String(measurement.bytesReceived), measurement.errorDescription ?? "", "", "", "", "", "", ""]
+             String(measurement.bytesReceived), measurement.errorDescription ?? "", "", "", "", "", "", "",
+             measurement.networkContext?.summary ?? "Not recorded", "", ""]
         }
         rows += history.incidents.map { incident in
             ["incident", "", "", "", "", incident.id.uuidString, ISTDate.string(incident.startedAt),
              incident.endedAt.map(ISTDate.string) ?? "", Self.number(incident.lowestMbps),
-             Self.number(incident.thresholdMbps), incident.kind.rawValue]
+             Self.number(incident.thresholdMbps), incident.kind.rawValue, "",
+             incident.startNetworkContext?.summary ?? "Not recorded", incident.endNetworkContext?.summary ?? "Not recorded"]
+        }
+        rows += networkChanges.map { change in
+            ["network_change", ISTDate.string(change.timestamp), "", "", "", "", "", "", "", "", "",
+             change.summary, "", ""]
         }
         let csv = rows.map { $0.map(Self.csvCell).joined(separator: ",") }.joined(separator: "\r\n") + "\r\n"
         try Data(csv.utf8).write(to: url, options: .atomic)
@@ -204,6 +220,7 @@ public final class HistoryStore {
 
     private static func isValid(_ measurement: Measurement) -> Bool {
         measurement.timestamp.timeIntervalSince1970.isFinite && measurement.bytesReceived >= 0
+            && (measurement.networkContext?.isValid ?? true)
             && (measurement.megabitsPerSecond.map { $0.isFinite && $0 >= 0 } ?? true)
     }
 
@@ -218,6 +235,7 @@ public final class HistoryStore {
                       && (incident.endedAt.map { $0.timeIntervalSince1970.isFinite && $0 >= incident.startedAt } ?? true)
                       && incident.thresholdMbps.isFinite && incident.thresholdMbps > 0
                       && (incident.lowestMbps.map { $0.isFinite && $0 >= 0 } ?? true)
+                      && (incident.startNetworkContext?.isValid ?? true) && (incident.endNetworkContext?.isValid ?? true)
               }) else { throw HistoryError.invalidMeasurement }
     }
 
