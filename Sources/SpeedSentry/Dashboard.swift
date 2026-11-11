@@ -95,6 +95,17 @@ struct DashboardView: View {
                 }
                 Text(report.text).font(.system(.body, design: .monospaced)).textSelection(.enabled)
                 Divider()
+                Text("Recent speed incidents · network context").font(.title2.bold())
+                if model.history.incidents.isEmpty { Text("No speed incidents recorded.").foregroundColor(.secondary) }
+                ForEach(Array(model.history.incidents.suffix(30).reversed())) { incident in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("\(ISTDate.string(incident.startedAt)) · \(incident.kind == .slow ? "Slow download" : "Download unavailable")").font(.headline)
+                        Text("At start: \(incident.startNetworkContext?.summary ?? "Network context not recorded")")
+                        Text(incident.endedAt.map { "Recovered: \(ISTDate.string($0))" } ?? "Ongoing")
+                        if incident.endedAt != nil { Text("At recovery: \(incident.endNetworkContext?.summary ?? "Network context not recorded")") }
+                        incidentChanges(start: incident.startedAt, end: incident.endedAt)
+                    }.font(.callout).textSelection(.enabled).padding(.vertical, 5)
+                }
                 Text("Recent connection outages").font(.title2.bold())
                 if model.insights.outages.isEmpty { Text("No confirmed connection outages recorded.").foregroundColor(.secondary) }
                 ForEach(Array(model.insights.outages.suffix(30).reversed())) { outage in
@@ -102,7 +113,19 @@ struct DashboardView: View {
                         Text(ISTDate.string(outage.startedAt)).font(.headline)
                         Text(outage.endedAt.map { "\(outage.interrupted ? "Observation ended" : "Recovered"): \(ISTDate.string($0))" } ?? "Ongoing")
                             .foregroundColor(.secondary)
+                        Text("At start: \(outage.startNetworkContext?.summary ?? "Network context not recorded")")
+                        if outage.endedAt != nil { Text("At end: \(outage.endNetworkContext?.summary ?? "Network context not recorded")") }
+                        incidentChanges(start: outage.startedAt, end: outage.endedAt)
                     }.padding(.vertical, 3)
+                }
+                Text("Network/profile timeline (IST)").font(.title2.bold())
+                Text("Observed path and Wi-Fi names help correlate changes; they do not prove the cause. Hidden SSIDs cannot reliably distinguish two Wi-Fi networks. Exports include observed network names.")
+                    .font(.caption).foregroundColor(.secondary)
+                ForEach(Array(model.insights.networkChanges.filter { $0.timestamp >= start && $0.timestamp <= end }.suffix(100).reversed())) { change in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(ISTDate.string(change.timestamp)).font(.headline)
+                        Text(change.summary).font(.callout)
+                    }.textSelection(.enabled).padding(.vertical, 3)
                 }
                 Text("Recent uploads").font(.title2.bold())
                 ForEach(Array(model.insights.uploads.suffix(10).reversed().enumerated()), id: \.offset) { _, upload in
@@ -110,6 +133,13 @@ struct DashboardView: View {
                 }
             }.padding(28)
         }.frame(minWidth: 780, minHeight: 580)
+    }
+    @ViewBuilder private func incidentChanges(start: Date, end: Date?) -> some View {
+        let changes = model.insights.networkChanges.filter { $0.timestamp >= start && $0.timestamp <= (end ?? Date()) }
+        ForEach(Array(changes.suffix(20))) { change in
+            Text("\(ISTDate.string(change.timestamp)) · \(change.summary)").foregroundColor(.secondary)
+        }
+        if changes.count > 20 { Text("Showing the most recent 20 context events; see the daily report for more.").font(.caption) }
     }
     private static func axisTime(_ date: Date) -> String {
         let formatter = DateFormatter()

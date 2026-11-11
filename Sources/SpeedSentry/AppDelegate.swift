@@ -18,7 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private let pathMonitor = NWPathMonitor()
     private var networkName = "Detecting network"
     private var currentSSID: String?
-    private var networkIdentity: String?
+    private var currentPath: NWPath?
+    private var networkContext: NetworkContext?
     private var expensiveNetwork = false
     private var connectionFailures = 0
     private var latestConnection: ConnectionSample?
@@ -253,6 +254,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             detail.autoenablesItems = false
             label("Started: \(ISTDate.string(incident.startedAt))", to: detail)
             label(incident.endedAt.map { "Recovered: \(ISTDate.string($0))" } ?? "Recovery not yet observed", to: detail)
+            label("At start: \(incident.startNetworkContext?.summary ?? "Network context not recorded")", to: detail)
+            if incident.endedAt != nil { label("At recovery: \(incident.endNetworkContext?.summary ?? "Network context not recorded")", to: detail) }
             item.submenu = detail
             incidents.addItem(item)
         }
@@ -362,6 +365,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     private func checkNow() {
+        refreshNetworkContext()
         guard !preview, !isSleeping, !isChecking, uploadTask == nil, !speedTestsBlocked, store != nil, insights != nil else { return }
         connectionTask?.cancel(); connectionTask = nil
         probe = SpeedProbe(lowDataMode: lowDataMode)
@@ -369,15 +373,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         lastAttempt = Date()
         if !paused { scheduleNext(from: lastAttempt!) }
         let currentGeneration = generation
+        let context = networkContext
+        let checkThreshold = effectiveThreshold
         render()
         checkTask = Task { [weak self] in
             guard let self else { return }
-            let result = await self.probe.measure()
+            let measured = await self.probe.measure()
             defer { self.finishCheck() }
+            self.refreshNetworkContext()
             guard !Task.isCancelled, currentGeneration == self.generation else { return }
+            let result = Measurement(timestamp: measured.timestamp, megabitsPerSecond: measured.megabitsPerSecond,
+                bytesReceived: measured.bytesReceived, errorDescription: measured.errorDescription, networkContext: context)
             self.latest = result
             do {
-                let event = try self.store?.record(result, thresholdMbps: self.effectiveThreshold)
+                let event = try self.store?.record(result, thresholdMbps: checkThreshold)
                 self.storageError = nil
                 if self.nextCheck == nil { self.scheduleNext(from: self.lastAttempt ?? Date()) }
                 if let event { self.notify(event) }
@@ -512,7 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         panel.canCreateDirectories = true
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try store.exportCSV(to: url) }
+        do { try store.exportCSV(to: url, networkChanges: insights?.snapshot.networkChanges ?? []) }
         catch { showError("Export failed", error.localizedDescription) }
     }
 
@@ -641,17 +650,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 extension AppDelegate {
     private func refreshDashboard() {
         dashboardModel.history = store?.history ?? HistorySnapshot()
+        dashboardModel.insights = insights?.snapshot ?? InsightsSnapshot()
         if preview {
             let now = Date()
+            let distant = NetworkContext(kind: .wifi, interfaceName: "en0", ssid: "Demo — Upstairs", rssiDBm: -82)
+            let nearby = NetworkContext(kind: .wifi, interfaceName: "en0", ssid: "Demo — Office", rssiDBm: -48)
+            let incidentStart = now.addingTimeInterval(-1200), recovered = now.addingTimeInterval(-600)
             var samples: [SpeedSentryCore.Measurement] = []
             for i in 0..<168 {
                 let date = now.addingTimeInterval(Double(i - 167) * 3600)
                 let speed: Double = i % 31 == 0 ? 14 : Double(80 + i % 23)
                 samples.append(SpeedSentryCore.Measurement(timestamp: date, megabitsPerSecond: speed, bytesReceived: SpeedProbe.downloadBytes, errorDescription: nil))
             }
-            dashboardModel.history = HistorySnapshot(measurements: samples)
+            dashboardModel.history = HistorySnapshot(measurements: samples, incidents: [
+                Incident(startedAt: incidentStart, endedAt: recovered, lowestMbps: 12, thresholdMbps: 20, kind: .slow,
+                    startNetworkContext: distant, endNetworkContext: nearby)
+            ])
+            dashboardModel.insights.networkChanges = [
+                NetworkChange(id: UUID(), timestamp: incidentStart, previous: nil, current: distant),
+                NetworkChange(id: UUID(), timestamp: now.addingTimeInterval(-900), previous: distant, current: nearby)
+            ]
         }
-        dashboardModel.insights = insights?.snapshot ?? InsightsSnapshot()
         dashboardModel.threshold = effectiveThreshold
         dashboardModel.wifi = wifiReading
         dashboardModel.wifiEpisode = wifiPolicy.activeEpisode
@@ -687,21 +706,27 @@ extension AppDelegate {
         }
         timer.tolerance = 5; RunLoop.main.add(timer, forMode: .common); connectionTimer = timer
     }
-    private func stopConnectionMonitoring() {
+    private func stopConnectionMonitoring(resetNetworkObservation: Bool = true) {
         stopWiFiSignalMonitoring()
         connectionTimer?.invalidate(); connectionTimer = nil
         connectionTask?.cancel(); connectionTask = nil
         uploadTask?.cancel(); uploadTask = nil
         connectionFailures = 0
+        if resetNetworkObservation { insights?.resetNetworkObservation() }
         do { try insights?.interrupt() } catch { insightsFailed(error) }
     }
     private func runConnectionCheck() {
+        refreshNetworkContext()
         render() // Refresh staleness even when full tests are blocked.
         guard !preview, !paused, !isSleeping, !isChecking, uploadTask == nil, connectionTask == nil, storageError == nil else { return }
         let token = generation
+        let context = networkContext
         connectionTask = Task { [weak self] in
-            let sample = await ConnectionProbe().measure()
+            let measured = await ConnectionProbe().measure()
+            self?.refreshNetworkContext()
             guard let self, !Task.isCancelled, token == self.generation else { return }
+            let sample = ConnectionSample(timestamp: measured.timestamp, latencyMilliseconds: measured.latencyMilliseconds,
+                reachable: measured.reachable, networkContext: context)
             self.connectionTask = nil; self.latestConnection = sample
             self.connectionFailures = sample.reachable ? 0 : self.connectionFailures + 1
             do {
@@ -762,33 +787,51 @@ extension AppDelegate {
     }
     private func startNetworkMonitoring() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
-            let kind = path.usesInterfaceType(.wifi) ? "Wi-Fi" : path.usesInterfaceType(.wiredEthernet) ? "Ethernet" : "Other network"
-            let metered = path.isExpensive || path.isConstrained
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let ssid = path.usesInterfaceType(.wifi) ? CWWiFiClient.shared().interface()?.ssid() : nil
-                let identity = "\(kind)|\(ssid ?? "unknown")|\(metered)"
-                self.usingWiFi = path.usesInterfaceType(.wifi)
-                self.wifiInterfaceName = path.availableInterfaces.first(where: { $0.type == .wifi })?.name
-                self.currentSSID = ssid; self.networkName = ssid ?? kind
-                self.expensiveNetwork = metered
-                guard self.networkIdentity != identity else { return }
-                let wasKnown = self.networkIdentity != nil
-                self.networkIdentity = identity
-                if wasKnown { self.networkSettingsChanged() }
-                else if !self.paused {
-                    self.startConnectionMonitoring()
-                    if !self.speedTestsBlocked { self.checkNow() }
-                }
-                self.render()
+                self.currentPath = path
+                self.refreshNetworkContext()
             }
         }
         pathMonitor.start(queue: DispatchQueue(label: "app.speedsentry.network"))
     }
+    /// Poll the SSID as well as NWPath: roaming between Wi-Fi networks can leave
+    /// the path/interface unchanged and may not produce a path callback.
+    @discardableResult private func refreshNetworkContext(restartOnChange: Bool = true) -> Bool {
+        guard !preview, let path = currentPath else { return false }
+        let type: NWInterface.InterfaceType = path.usesInterfaceType(.wifi) ? .wifi
+            : path.usesInterfaceType(.wiredEthernet) ? .wiredEthernet
+            : path.usesInterfaceType(.cellular) ? .cellular : .other
+        let kind: NetworkContext.Kind = type == .wifi ? .wifi : type == .wiredEthernet ? .ethernet : type == .cellular ? .cellular : .other
+        let interfaceName = path.availableInterfaces.first(where: { $0.type == type })?.name
+        let wifi = type == .wifi ? CWWiFiClient.shared().interface(withName: interfaceName) : nil
+        currentSSID = wifi?.ssid().flatMap { $0.isEmpty ? nil : $0 }
+        usingWiFi = type == .wifi; wifiInterfaceName = usingWiFi ? interfaceName : nil
+        expensiveNetwork = path.isExpensive || path.isConstrained
+        networkName = currentSSID ?? (usingWiFi ? "Wi-Fi (SSID unavailable)" : type == .wiredEthernet ? "Ethernet" : "Other network")
+        let context = NetworkContext(kind: kind, interfaceName: interfaceName, ssid: currentSSID,
+            rssiDBm: wifi?.rssiValue(), pathAvailable: path.status == .satisfied, metered: expensiveNetwork,
+            profileName: activeProfile?.name ?? "Default", thresholdMbps: effectiveThreshold)
+        let previous = networkContext
+        networkContext = context
+        if !paused, !isSleeping, storageError == nil {
+            do { try insights?.observeNetwork(context) } catch { insightsFailed(error); return false }
+        }
+        let changed = previous.map { !$0.hasSameIdentity(as: context) } ?? true
+        guard changed, restartOnChange else { return false }
+        if previous != nil { networkSettingsChanged() }
+        else if !paused {
+            startConnectionMonitoring()
+            if !speedTestsBlocked { checkNow() }
+        }
+        render()
+        return true
+    }
     private func networkSettingsChanged() {
+        refreshNetworkContext(restartOnChange: false)
         generation += 1; pendingAutomaticCheck = false
         checkTask?.cancel(); probe.cancel()
-        stopConnectionMonitoring(); latestConnection = nil
+        stopConnectionMonitoring(resetNetworkObservation: false); latestConnection = nil
         timer?.invalidate(); nextCheck = nil
         startConnectionMonitoring()
         scheduleNext(from: lastAttempt ?? Date())
@@ -856,6 +899,7 @@ extension AppDelegate {
     }
     private func updateWiFiSignal() {
         guard !preview, !paused, !isSleeping else { return }
+        if refreshNetworkContext() { return }
         let observation = WiFiSignalReader.read(usingWiFi: usingWiFi, interfaceName: wifiInterfaceName)
         wifiReading = observation.reading
         let previousEpisode = wifiPolicy.activeEpisode
